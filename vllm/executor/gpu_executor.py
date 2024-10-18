@@ -54,7 +54,6 @@ class GPUExecutor(ExecutorBase):
             local_rank=local_rank,
             rank=rank,
             distributed_init_method=distributed_init_method,
-            speculative_config=self.speculative_config,
             is_driver_worker=(not self.parallel_config)
             or (rank % self.parallel_config.tensor_parallel_size == 0),
         )
@@ -65,9 +64,6 @@ class GPUExecutor(ExecutorBase):
         if self.scheduler_config.is_multi_step:
             worker_module_name = "vllm.worker.multi_step_worker"
             worker_class_name = "MultiStepWorker"
-        elif self.speculative_config:
-            worker_module_name = "vllm.spec_decode.spec_decode_worker"
-            worker_class_name = "create_spec_worker"
         else:
             worker_module_name = "vllm.worker.worker"
             worker_class_name = "Worker"

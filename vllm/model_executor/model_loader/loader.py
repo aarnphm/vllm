@@ -22,8 +22,7 @@ from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoadFormat,
-                         ModelConfig, MultiModalConfig,
-                         ParallelConfig, SchedulerConfig)
+                         ModelConfig, ParallelConfig, SchedulerConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.envs import VLLM_USE_MODELSCOPE
@@ -38,7 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_gguf_extra_tensor_names, get_quant_config, gguf_quant_weights_iterator,
     initialize_dummy_weights, np_cache_weights_iterator, pt_weights_iterator,
     safetensors_weights_iterator)
-from vllm.model_executor.models import has_inner_state, supports_multimodal
+from vllm.model_executor.models import has_inner_state
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
@@ -116,15 +115,9 @@ def _get_quantization_config(
 
 def _get_model_initialization_kwargs(
         model_class: Type[nn.Module],
-        multimodal_config: Optional[MultiModalConfig],
         scheduler_config: Optional[SchedulerConfig] = None) -> Dict[str, Any]:
     """Get extra kwargs for model initialization."""
     extra_kwargs: Dict[str, Any] = {}
-
-    if supports_multimodal(model_class):
-        assert multimodal_config is not None
-
-        extra_kwargs["multimodal_config"] = multimodal_config
 
     if has_inner_state(model_class) and scheduler_config:
         extra_kwargs["scheduler_config"] = scheduler_config
@@ -135,10 +128,8 @@ def _get_model_initialization_kwargs(
 def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 cache_config: Optional[CacheConfig],
                 quant_config: Optional[QuantizationConfig], *,
-                multimodal_config: Optional[MultiModalConfig],
                 scheduler_config: Optional[SchedulerConfig]) -> nn.Module:
     extra_kwargs = _get_model_initialization_kwargs(model_class,
-                                                    multimodal_config,
                                                     scheduler_config)
 
     return model_class(config=hf_config,
@@ -160,7 +151,6 @@ def _initialize_model(
         model_config.hf_config,
         cache_config=cache_config,
         quant_config=_get_quantization_config(model_config, load_config),
-        multimodal_config=model_config.multimodal_config,
         scheduler_config=scheduler_config,
     )
 

@@ -91,12 +91,8 @@ class ModelConfig:
             matches the model name exposed via the APIs. If multiple model
             names provided, the first name will be used. If not specified,
             the model name will be the same as `model`.
-        limit_mm_per_prompt: Maximum number of data instances per modality
-            per prompt. Only applicable for multimodal models.
         config_format: The config format which shall be loaded.
             Defaults to 'auto' which defaults to 'hf'.
-        mm_processor_kwargs: Arguments to be forwarded to the model's processor
-            for multi-modal data, e.g., image processor.
     """
 
     def __init__(self,
@@ -122,10 +118,8 @@ class ModelConfig:
                  disable_sliding_window: bool = False,
                  skip_tokenizer_init: bool = False,
                  served_model_name: Optional[Union[str, List[str]]] = None,
-                 limit_mm_per_prompt: Optional[Mapping[str, int]] = None,
                  use_async_output_proc: bool = True,
-                 config_format: ConfigFormat = ConfigFormat.AUTO,
-                 mm_processor_kwargs: Optional[Dict[str, Any]] = None) -> None:
+                 config_format: ConfigFormat = ConfigFormat.AUTO) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
@@ -159,7 +153,6 @@ class ModelConfig:
             self.model, revision)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
         self.use_async_output_proc = use_async_output_proc
-        self.mm_processor_kwargs = mm_processor_kwargs
 
         # Set enforce_eager to False if the value is unset.
         if self.enforce_eager is None:
@@ -189,8 +182,6 @@ class ModelConfig:
             spec_target_max_model_len=spec_target_max_model_len)
         self.served_model_name = get_served_model_name(model,
                                                        served_model_name)
-        self.multimodal_config = self._init_multimodal_config(
-            limit_mm_per_prompt)
         if not self.skip_tokenizer_init:
             self._verify_tokenizer_mode()
 
@@ -201,19 +192,6 @@ class ModelConfig:
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
-
-    def _init_multimodal_config(
-        self, limit_mm_per_prompt: Optional[Mapping[str, int]]
-    ) -> Optional["MultiModalConfig"]:
-        architectures = getattr(self.hf_config, "architectures", [])
-        if ModelRegistry.is_multimodal_model(architectures):
-            return MultiModalConfig(limit_per_prompt=limit_mm_per_prompt or {})
-
-        if limit_mm_per_prompt:
-            raise ValueError("`limit_mm_per_prompt` is only supported for "
-                             "multimodal models.")
-
-        return None
 
     def _init_attention_free(self) -> bool:
         architectures = getattr(self.hf_config, "architectures", [])
@@ -541,18 +519,6 @@ class ModelConfig:
                          ["attention"] * num_layers)
         return len([t for t in layers if t == "attention"])
 
-    def get_multimodal_config(self) -> "MultiModalConfig":
-        """
-        Get the multimodal configuration of the model.
-
-        Raises:
-            ValueError: If the model is not multimodal.
-        """
-        if self.multimodal_config is None:
-            raise ValueError("The model is not multimodal.")
-
-        return self.multimodal_config
-
     @property
     def is_encoder_decoder_model(self) -> bool:
         """Extract the HF encoder/decoder model flag."""
@@ -566,8 +532,7 @@ class ModelConfig:
         return self.embedding_mode
 
     @property
-    def is_multimodal_model(self) -> bool:
-        return self.multimodal_config is not None
+    def is_multimodal_model(self) -> bool: return False
 
 
 class CacheConfig:
@@ -1416,19 +1381,6 @@ class SpeculativeConfig:
             draft_model = self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({draft_model=}, {num_spec_tokens=})"
-
-
-@dataclass
-class MultiModalConfig:
-    """Controls the behavior of multimodal models."""
-
-    limit_per_prompt: Mapping[str, int] = field(default_factory=dict)
-    """
-    The maximum number of multi-modal input instances allowed per prompt
-    for each :class:`~vllm.multimodal.MultiModalPlugin`.
-    """
-
-    # TODO: Add configs to init vision tower or not.
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

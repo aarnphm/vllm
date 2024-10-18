@@ -9,14 +9,12 @@ from transformers import PretrainedConfig
 from typing_extensions import TypeVar
 
 from vllm.logger import init_logger
-from vllm.utils import (get_allowed_kwarg_only_overrides, print_warning_once,
-                        resolve_mm_processor_kwargs)
+from vllm.utils import get_allowed_kwarg_only_overrides, print_warning_once
 
 from .data import DecoderOnlyInputs
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
-    from vllm.multimodal import MultiModalDataDict, MultiModalRegistry
     from vllm.sequence import SequenceData
 
 logger = init_logger(__name__)
@@ -69,35 +67,14 @@ class DummyDataFactory(Protocol):
         self,
         ctx: InputContext,
         seq_len: int,
-        mm_counts: Mapping[str, int],
-        **mm_processor_kwargs: Any,
-    ) -> Tuple["SequenceData", Optional["MultiModalDataDict"]]:
+    ) -> "SequenceData":
         """
         Create dummy data to be inputted into the model.
 
         Note:
             :data:`InputProcessor` is not applied to the dummy data.
-
-            The :code:`mm_processor_kwargs` are overrides provided at
-            initialization time to values in the config whose values
-            may affect the number of tokens per instance.
         """
         ...
-
-
-class _MultiModalCounts(UserDict):
-    """
-    Wraps `mm_counts` for a more informative error message
-    when attempting to access a plugin that does not exist.
-    """
-
-    def __getitem__(self, key: str) -> int:
-        try:
-            return super().__getitem__(key)
-        except KeyError as exc:
-            msg = (f"There is no multi-modal plugin with the key: {key}. "
-                   f"Available keys: {set(self.keys())}")
-            raise KeyError(msg) from exc
 
 
 InputProcessor = Callable[[InputContext, DecoderOnlyInputs], DecoderOnlyInputs]
@@ -122,8 +99,7 @@ class InputRegistry:
         self,
         ctx: InputContext,
         seq_len: int,
-        mm_counts: Mapping[str, int],
-    ) -> Tuple["SequenceData", Optional["MultiModalDataDict"]]:
+    ) -> "SequenceData":
         """
         The default dummy data factory represents the longest possible text
         that can be inputted to the model.
@@ -135,9 +111,8 @@ class InputRegistry:
         from vllm.sequence import SequenceData
 
         dummy_seq_data = SequenceData.from_prompt_token_counts((0, seq_len))
-        dummy_multi_modal_data = None
 
-        return dummy_seq_data, dummy_multi_modal_data
+        return dummy_seq_data
 
     def register_dummy_data(self, factory: DummyDataFactory):
         """
@@ -162,8 +137,7 @@ class InputRegistry:
         return wrapper
 
     def _get_dummy_data_factory(self, model_cls: Type[nn.Module]):
-        return self._dummy_factories_by_model_type \
-            .get(model_cls, self._default_dummy_data_factory)
+        return self._dummy_factories_by_model_type.get(model_cls, self._default_dummy_data_factory)
 
     def register_dummy_encoder_data(self, factory: DummyDataFactory):
         """
@@ -186,16 +160,14 @@ class InputRegistry:
         return wrapper
 
     def _get_dummy_encoder_data_factory(self, model_cls: Type[nn.Module]):
-        return self._dummy_encoder_factories_by_model_type \
-            .get(model_cls, self._default_dummy_data_factory)
+        return self._dummy_encoder_factories_by_model_type.get(model_cls, self._default_dummy_data_factory)
 
     def dummy_data_for_profiling(
         self,
         model_config: "ModelConfig",
         seq_len: int,
-        mm_registry: "MultiModalRegistry",
         is_encoder_data: bool = False,
-    ) -> Tuple["SequenceData", Optional["MultiModalDataDict"]]:
+    ) -> "SequenceData":
         """
         Create dummy data for profiling the memory usage of a model.
 
@@ -216,13 +188,8 @@ class InputRegistry:
             dummy_factory = self._get_dummy_encoder_data_factory(model_cls)
         else:
             dummy_factory = self._get_dummy_data_factory(model_cls)
-        mm_counts = mm_registry.get_mm_limits_per_prompt(model_config)
-        mm_processor_kwargs = get_allowed_kwarg_only_overrides(
-            dummy_factory, overrides=model_config.mm_processor_kwargs)
 
-        seq_data, mm_data = dummy_factory(InputContext(model_config), seq_len,
-                                          _MultiModalCounts(mm_counts),
-                                          **mm_processor_kwargs)
+        seq_data = dummy_factory(InputContext(model_config), seq_len)
 
         # Having more tokens is over-conservative but otherwise fine
         num_tokens = seq_data.prompt_token_ids
@@ -235,15 +202,8 @@ class InputRegistry:
                 raise AssertionError(
                     f"Expected at least {seq_len} dummy tokens for profiling, "
                     f"but found {len(num_tokens)} tokens instead.")
-        if mm_data is not None:
-            for k, v in mm_data.items():
-                num_items = len(v) if isinstance(v, list) else 1
-                num_expected = mm_counts[k]
-                assert num_items >= num_expected, (
-                    f"Expected at least {num_expected} dummy '{k}' instances "
-                    f"for profiling, but found {num_items} instances instead.")
 
-        return seq_data, mm_data
+        return seq_data
 
     def _default_input_processor(
         self,
@@ -297,17 +257,7 @@ class InputRegistry:
         model_cls, _ = get_model_architecture(model_config)
         processor = self._get_model_input_processor(model_cls)
 
-        # Handle multimodal processor kwargs with priority:
-        #     Inference kwargs -> Init kwargs -> {}
-        # If it's empty, it'll fall back to the default kwarg values
-        mm_processor_kwargs = resolve_mm_processor_kwargs(
-            model_config.mm_processor_kwargs,
-            inputs.get("mm_processor_kwargs"),
-            processor,
-        )
-
-        return processor(InputContext(model_config), inputs,
-                         **mm_processor_kwargs)
+        return processor(InputContext(model_config), inputs)
 
     def create_input_processor(self, model_config: "ModelConfig"):
         """

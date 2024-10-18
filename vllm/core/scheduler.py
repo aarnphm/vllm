@@ -1199,13 +1199,6 @@ class Scheduler:
                     encoder_seq_data=encoder_seq_data,
                     cross_block_table=cross_block_table,
                     state=seq_group.state,
-                    # `multi_modal_data` will only be present for the 1st comm
-                    # between engine and worker.
-                    # the subsequent comms can still use delta, but
-                    # `multi_modal_data` will be None.
-                    multi_modal_data=seq_group.multi_modal_data
-                    if scheduler_outputs.num_prefill_groups > 0 else None,
-                    mm_processor_kwargs=seq_group.mm_processor_kwargs,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for

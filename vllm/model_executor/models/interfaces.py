@@ -8,57 +8,10 @@ from vllm.logger import init_logger
 from vllm.utils import supports_kw
 
 if TYPE_CHECKING:
-    from vllm.config import MultiModalConfig, SchedulerConfig
+    from vllm.config import SchedulerConfig
     from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
-
-
-@runtime_checkable
-class SupportsMultiModal(Protocol):
-    """The interface required for all multi-modal models."""
-
-    supports_multimodal: ClassVar[Literal[True]] = True
-    """
-    A flag that indicates this model supports multi-modal inputs.
-
-    Note:
-        There is no need to redefine this flag if this class is in the
-        MRO of your model class.
-    """
-
-    def __init__(self, *, multimodal_config: "MultiModalConfig") -> None:
-        ...
-
-
-# We can't use runtime_checkable with ClassVar for issubclass checks
-# so we need to treat the class as an instance and use isinstance instead
-@runtime_checkable
-class _SupportsMultiModalType(Protocol):
-    supports_multimodal: Literal[True]
-
-    def __call__(self, *, multimodal_config: "MultiModalConfig") -> None:
-        ...
-
-
-@overload
-def supports_multimodal(
-        model: Type[object]) -> TypeIs[Type[SupportsMultiModal]]:
-    ...
-
-
-@overload
-def supports_multimodal(model: object) -> TypeIs[SupportsMultiModal]:
-    ...
-
-
-def supports_multimodal(
-    model: Union[Type[object], object],
-) -> Union[TypeIs[Type[SupportsMultiModal]], TypeIs[SupportsMultiModal]]:
-    if isinstance(model, type):
-        return isinstance(model, _SupportsMultiModalType)
-
-    return isinstance(model, SupportsMultiModal)
 
 
 @runtime_checkable

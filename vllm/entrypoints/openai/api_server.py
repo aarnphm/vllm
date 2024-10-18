@@ -37,14 +37,7 @@ from vllm.entrypoints.openai.cli_args import (make_arg_parser,
 # yapf: disable
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               ChatCompletionResponse,
-                                              CompletionRequest,
-                                              CompletionResponse,
-                                              DetokenizeRequest,
-                                              DetokenizeResponse,
-                                              EmbeddingRequest,
-                                              EmbeddingResponse, ErrorResponse,
-                                              TokenizeRequest,
-                                              TokenizeResponse)
+                                              ErrorResponse)
 # yapf: enable
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_engine import BaseModelPath
@@ -247,37 +240,6 @@ async def health(raw_request: Request) -> Response:
     await engine_client(raw_request).check_health()
     return Response(status_code=200)
 
-
-@router.post("/tokenize")
-async def tokenize(request: TokenizeRequest, raw_request: Request):
-    generator = await tokenization(raw_request).create_tokenize(request)
-    if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
-    elif isinstance(generator, TokenizeResponse):
-        return JSONResponse(content=generator.model_dump())
-
-    assert_never(generator)
-
-
-@router.post("/detokenize")
-async def detokenize(request: DetokenizeRequest, raw_request: Request):
-    generator = await tokenization(raw_request).create_detokenize(request)
-    if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
-    elif isinstance(generator, DetokenizeResponse):
-        return JSONResponse(content=generator.model_dump())
-
-    assert_never(generator)
-
-
-@router.get("/v1/models")
-async def show_available_models(raw_request: Request):
-    models = await completion(raw_request).show_available_models()
-    return JSONResponse(content=models.model_dump())
-
-
 @router.get("/version")
 async def show_version():
     ver = {"version": VLLM_VERSION}
@@ -299,53 +261,6 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
-
-
-@router.post("/v1/completions")
-async def create_completion(request: CompletionRequest, raw_request: Request):
-    generator = await completion(raw_request).create_completion(
-        request, raw_request)
-    if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
-    elif isinstance(generator, CompletionResponse):
-        return JSONResponse(content=generator.model_dump())
-
-    return StreamingResponse(content=generator, media_type="text/event-stream")
-
-
-@router.post("/v1/embeddings")
-async def create_embedding(request: EmbeddingRequest, raw_request: Request):
-    generator = await embedding(raw_request).create_embedding(
-        request, raw_request)
-    if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
-    elif isinstance(generator, EmbeddingResponse):
-        return JSONResponse(content=generator.model_dump())
-
-    assert_never(generator)
-
-
-if envs.VLLM_TORCH_PROFILER_DIR:
-    logger.warning(
-        "Torch Profiler is enabled in the API server. This should ONLY be "
-        "used for local development!")
-
-    @router.post("/start_profile")
-    async def start_profile(raw_request: Request):
-        logger.info("Starting profiler...")
-        await engine_client(raw_request).start_profile()
-        logger.info("Profiler started.")
-        return Response(status_code=200)
-
-    @router.post("/stop_profile")
-    async def stop_profile(raw_request: Request):
-        logger.info("Stopping profiler...")
-        await engine_client(raw_request).stop_profile()
-        logger.info("Profiler stopped.")
-        return Response(status_code=200)
-
 
 def build_app(args: Namespace) -> FastAPI:
     if args.disable_fastapi_docs:

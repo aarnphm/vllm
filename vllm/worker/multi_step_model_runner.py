@@ -277,8 +277,6 @@ class StatefulModelInput(BroadcastableModelInput):
 
         # Assert unsupported
         assert fmi.attn_metadata is not None
-        assert fmi.multi_modal_kwargs is not None
-        assert len(fmi.multi_modal_kwargs) == 0
 
         self.frozen_model_input = dataclasses.replace(
             self.frozen_model_input,

@@ -1307,40 +1307,6 @@ def supports_kw(
     return False
 
 
-def resolve_mm_processor_kwargs(
-    init_kwargs: Optional[Dict[str, Any]],
-    inference_kwargs: Optional[Dict[str, Any]],
-    callable: Callable[..., object],
-    allow_var_kwargs: bool = False,
-) -> Dict[str, Any]:
-    """Applies filtering to eliminate invalid mm_processor_kwargs, i.e.,
-    those who are not explicit keywords to the given callable (of one is
-    given; otherwise no filtering is done), then merges the kwarg dicts,
-    giving priority to inference_kwargs if there are any collisions.
-
-    In the case that no kwarg overrides are provided, returns an empty
-    dict so that it can still be kwarg expanded into the callable later on.
-
-    If allow_var_kwargs=True, allows for things that can be expanded into
-    kwargs as long as they aren't naming collision for var_kwargs or potential
-    positional arguments.
-    """
-    # Filter inference time multimodal processor kwargs provided
-    runtime_mm_kwargs = get_allowed_kwarg_only_overrides(
-        callable,
-        overrides=inference_kwargs,
-        allow_var_kwargs=allow_var_kwargs)
-
-    # Filter init time multimodal processor kwargs provided
-    init_mm_kwargs = get_allowed_kwarg_only_overrides(
-        callable, overrides=init_kwargs, allow_var_kwargs=allow_var_kwargs)
-
-    # Merge the final processor kwargs, prioritizing inference
-    # time values over the initialization time values.
-    mm_processor_kwargs = {**init_mm_kwargs, **runtime_mm_kwargs}
-    return mm_processor_kwargs
-
-
 def get_allowed_kwarg_only_overrides(
     callable: Callable[..., object],
     overrides: Optional[Dict[str, Any]],

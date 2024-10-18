@@ -11,14 +11,12 @@ from transformers import PretrainedConfig
 import vllm.envs as envs
 from vllm.attention.selector import (_Backend, backend_name_to_enum,
                                      get_global_forced_attn_backend)
-from vllm.config import (CacheConfig, MultiModalConfig,
-                         SchedulerConfig)
+from vllm.config import CacheConfig, SchedulerConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.loader import build_model
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import ModelRegistry
-from vllm.multimodal.base import NestedTensors
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_cpu, is_pin_memory_available
@@ -209,7 +207,6 @@ def init_vllm_registered_model(
     cache_config: Optional[CacheConfig],
     quant_config: Optional[QuantizationConfig],
     *,
-    multimodal_config: Optional[MultiModalConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
 ) -> nn.Module:
     """
@@ -223,7 +220,6 @@ def init_vllm_registered_model(
         hf_config,
         cache_config,
         quant_config,
-        multimodal_config=multimodal_config,
         scheduler_config=scheduler_config,
     )
 
@@ -264,59 +260,6 @@ def flatten_bn(
         return torch.cat(x)
 
     return [x_n for x_b in x for x_n in x_b]
-
-
-def _flatten_embeddings(embeddings: NestedTensors) -> torch.Tensor:
-    """
-    Recursively flattens and concatenates NestedTensors on all but the last
-    dimension.
-    """
-
-    if isinstance(embeddings, torch.Tensor):
-        # Flatten all but the last dimension.
-        return embeddings.flatten(0, -2)
-
-    return torch.cat(tuple(_flatten_embeddings(t) for t in embeddings))
-
-
-def _embedding_count_expression(embeddings: NestedTensors) -> str:
-    """
-    Constructs a debugging representation of the number of embeddings in the
-    NestedTensors.
-    """
-
-    if isinstance(embeddings, torch.Tensor):
-        return " x ".join([str(dim) for dim in embeddings.shape[:-1]])
-
-    return " + ".join(
-        _embedding_count_expression(inner) for inner in embeddings)
-
-
-def merge_multimodal_embeddings(input_ids: torch.Tensor,
-                                inputs_embeds: torch.Tensor,
-                                multimodal_embeddings: NestedTensors,
-                                placeholder_token_id: int) -> torch.Tensor:
-    """
-    Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
-    positions in ``inputs_embeds`` corresponding to placeholder tokens in
-    ``input_ids``.
-
-    Note:
-        This updates ``inputs_embeds`` in place.
-    """
-    mask = (input_ids == placeholder_token_id)
-    num_expected_tokens = mask.sum().item()
-    assert isinstance(num_expected_tokens, int)
-
-    flattened = _flatten_embeddings(multimodal_embeddings)
-    if flattened.shape[0] != num_expected_tokens:
-        expr = _embedding_count_expression(multimodal_embeddings)
-        raise ValueError(
-            f"Attempted to assign {expr} = {flattened.shape[0]} "
-            f"multimodal tokens to {num_expected_tokens} placeholders")
-
-    inputs_embeds[mask] = flattened
-    return inputs_embeds
 
 
 class LayerFn(Protocol):

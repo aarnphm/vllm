@@ -110,7 +110,7 @@ class OpenAIServingChat(OpenAIServing):
             model_config = self.model_config
             tokenizer = await self.engine_client.get_tokenizer()
 
-            conversation, mm_data_future = parse_chat_messages_futures(
+            conversation = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
 
             tool_dicts = None if request.tools is None else [
@@ -143,12 +143,6 @@ class OpenAIServingChat(OpenAIServing):
                 )
         except Exception as e:
             logger.exception("Error in applying chat template from request")
-            return self.create_error_response(str(e))
-
-        try:
-            mm_data = await mm_data_future
-        except Exception as e:
-            logger.exception("Error in loading multi-modal data")
             return self.create_error_response(str(e))
 
         # validation for OpenAI tools
@@ -209,8 +203,6 @@ class OpenAIServingChat(OpenAIServing):
 
             engine_inputs = TokensPrompt(
                 prompt_token_ids=prompt_inputs["prompt_token_ids"])
-            if mm_data is not None:
-                engine_inputs["multi_modal_data"] = mm_data
 
             is_tracing_enabled = (await
                                   self.engine_client.is_tracing_enabled())

@@ -1,6 +1,4 @@
-from .interfaces import (HasInnerState, SupportsMultiModal,
-                         SupportsPP, has_inner_state,
-                         supports_multimodal, supports_pp)
+from .interfaces import HasInnerState, SupportsPP, has_inner_state, supports_pp
 from .interfaces_base import (VllmModelForEmbedding,
                               VllmModelForTextGeneration, is_embedding_model,
                               is_text_generation_model)
@@ -14,8 +12,6 @@ __all__ = [
     "is_text_generation_model",
     "HasInnerState",
     "has_inner_state",
-    "SupportsMultiModal",
-    "supports_multimodal",
     "SupportsPP",
     "supports_pp",
 ]

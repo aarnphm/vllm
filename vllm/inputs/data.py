@@ -3,9 +3,6 @@ from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterable, List,
 
 from typing_extensions import NotRequired, TypedDict, TypeVar
 
-if TYPE_CHECKING:
-    from vllm.multimodal import MultiModalDataDict
-
 
 class TextPrompt(TypedDict):
     """Schema for a text prompt."""
@@ -13,41 +10,11 @@ class TextPrompt(TypedDict):
     prompt: str
     """The input text to be tokenized before passing to the model."""
 
-    multi_modal_data: NotRequired["MultiModalDataDict"]
-    """
-    Optional multi-modal data to pass to the model,
-    if the model supports it.
-    """
-
-    mm_processor_kwargs: NotRequired[Dict[str, Any]]
-    """
-    Optional multi-modal processor kwargs to be forwarded to the
-    multimodal input mapper & processor. Note that if multiple modalities
-    have registered mappers etc for the model being considered, we attempt
-    to pass the mm_processor_kwargs to each of them.
-    """
-
-
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
 
     prompt_token_ids: List[int]
     """A list of token IDs to pass to the model."""
-
-    multi_modal_data: NotRequired["MultiModalDataDict"]
-    """
-    Optional multi-modal data to pass to the model,
-    if the model supports it.
-    """
-
-    mm_processor_kwargs: NotRequired[Dict[str, Any]]
-    """
-    Optional multi-modal processor kwargs to be forwarded to the
-    multimodal input mapper & processor. Note that if multiple modalities
-    have registered mappers etc for the model being considered, we attempt
-    to pass the mm_processor_kwargs to each of them.
-    """
-
 
 SingletonPrompt = Union[str, TextPrompt, TokensPrompt]
 """
@@ -105,8 +72,6 @@ class ExplicitEncoderDecoderPrompt(TypedDict, Generic[_T1_co, _T2_co]):
 
     decoder_prompt: Optional[_T2_co]
 
-    mm_processor_kwargs: NotRequired[Dict[str, Any]]
-
 
 PromptType = Union[SingletonPrompt, ExplicitEncoderDecoderPrompt]
 """
@@ -130,36 +95,14 @@ class TokenInputs(TypedDict):
     The original prompt text corresponding to the token IDs, if available.
     """
 
-    multi_modal_data: NotRequired[Optional["MultiModalDataDict"]]
-    """
-    Optional multi-modal data to pass to the model,
-    if the model supports it.
-    """
-
-    mm_processor_kwargs: NotRequired[Optional[Dict[str, Any]]]
-    """
-    Optional multi-modal processor kwargs to be forwarded to the
-    multimodal input mapper & processor. Note that if multiple modalities
-    have registered mappers etc for the model being considered, we attempt
-    to pass the mm_processor_kwargs to each of them.
-    """
-
-
 def token_inputs(
     prompt_token_ids: List[int],
     prompt: Optional[str] = None,
-    multi_modal_data: Optional["MultiModalDataDict"] = None,
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
 ) -> TokenInputs:
     """Construct :class:`TokenInputs` from optional values."""
     inputs = TokenInputs(prompt_token_ids=prompt_token_ids)
 
-    if prompt is not None:
-        inputs["prompt"] = prompt
-    if multi_modal_data is not None:
-        inputs["multi_modal_data"] = multi_modal_data
-    if mm_processor_kwargs is not None:
-        inputs["mm_processor_kwargs"] = mm_processor_kwargs
+    if prompt is not None: inputs["prompt"] = prompt
 
     return inputs
 
@@ -192,12 +135,6 @@ class EncoderDecoderInputs(TokenInputs):
     """
     The original encoder prompt text corresponding to the token IDs, if
     available.
-    """
-
-    encoder_multi_modal_data: NotRequired[Optional["MultiModalDataDict"]]
-    """
-    Optional multi-modal data to pass to the encoder model,
-    if the model supports it.
     """
 
 

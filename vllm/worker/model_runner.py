@@ -32,10 +32,7 @@ from vllm.model_executor import SamplingMetadata, SamplingMetadataCache
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
-from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
-                             MultiModalInputs, MultiModalRegistry)
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.transformers_utils.config import uses_mrope
@@ -86,7 +83,6 @@ class ModelInputForGPU(ModelRunnerInputBase):
     seq_lens: Optional[List[int]] = None
     query_lens: Optional[List[int]] = None
     attn_metadata: Optional["AttentionMetadata"] = None
-    multi_modal_kwargs: Optional[BatchedTensorInputs] = None
     request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
     finished_requests_ids: Optional[List[str]] = None
     virtual_engine: int = 0
@@ -98,7 +94,6 @@ class ModelInputForGPU(ModelRunnerInputBase):
         tensor_dict = {
             "input_tokens": self.input_tokens,
             "input_positions": self.input_positions,
-            "multi_modal_kwargs": self.multi_modal_kwargs,
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
@@ -132,7 +127,6 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
         tensor_dict = {
             "input_tokens": self.input_tokens,
             "input_positions": self.input_positions,
-            "multi_modal_kwargs": self.multi_modal_kwargs,
             "virtual_engine": self.virtual_engine,
             "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
             "finished_requests_ids": self.finished_requests_ids,
@@ -201,9 +195,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             context_lens: Optional[List[int]] = None,
             # The current sliding window block.
             curr_sliding_window_blocks: Optional[List[int]] = None,
-
-            # Multi-modal inputs.
-            multi_modal_inputs: Optional[MultiModalInputs] = None,
 
             # Whether the prefix cache is hit (prefill only).
             prefix_cache_hit: bool = False,
@@ -285,7 +276,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 self.curr_sliding_window_blocks = \
                     curr_sliding_window_blocks or []
 
-            self.multi_modal_inputs = multi_modal_inputs
             self.prefix_cache_hit = prefix_cache_hit
 
             self.n_seqs = len(self.seq_ids)
@@ -346,9 +336,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         ]
         # Compute functions for each sequence group.
         # WARNING: The order of the functions matters!
-        self.per_seq_group_compute_fns = [
-            self._compute_multi_modal_input,
-        ]
+        self.per_seq_group_compute_fns = []
 
         self.runner = runner
         self.model_input_cls = self.runner._model_input_cls
@@ -356,7 +344,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.scheduler_config = self.runner.scheduler_config
         self.sliding_window = self.runner.sliding_window
         self.block_size = self.runner.block_size
-        self.multi_modal_input_mapper = self.runner.multi_modal_input_mapper
         self.finished_requests_ids = finished_requests_ids
         self.decode_only = True
 
@@ -502,52 +489,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         inter_data.curr_sliding_window_blocks[
             seq_idx] = curr_sliding_window_block
         inter_data.seq_lens[seq_idx] = sliding_seq_len
-
-    def _compute_multi_modal_input(self, inter_data: InterDataForSeqGroup,
-                                   seq_group_metadata: SequenceGroupMetadata):
-        """If multi-modal data is given, add it to the input."""
-        mm_data = seq_group_metadata.multi_modal_data
-        if not mm_data:
-            return
-
-        mm_kwargs = self.multi_modal_input_mapper(
-            mm_data,
-            mm_processor_kwargs=seq_group_metadata.mm_processor_kwargs)
-        inter_data.multi_modal_inputs = mm_kwargs
-
-        # special processing for mrope position deltas.
-        if self.runner.model_is_mrope:
-            image_grid_thw = mm_kwargs.get("image_grid_thw", None)
-            video_grid_thw = mm_kwargs.get("video_grid_thw", None)
-            assert image_grid_thw is not None or video_grid_thw is not None, (
-                "mrope embedding type requires multi-modal input mapper "
-                "returns 'image_grid_thw' or 'video_grid_thw'.")
-
-            hf_config = self.runner.model_config.hf_config
-
-            inter_data.mrope_input_positions = [None] * inter_data.n_seqs
-            for seq_idx in range(inter_data.n_seqs):
-                seq_data = seq_group_metadata.seq_data[
-                    inter_data.seq_ids[seq_idx]]
-                token_ids = seq_data.get_token_ids()
-
-                mrope_input_positions, mrope_position_delta = \
-                    MRotaryEmbedding.get_input_positions(
-                        token_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        image_token_id=hf_config.image_token_id,
-                        video_token_id=hf_config.video_token_id,
-                        vision_start_token_id=hf_config.vision_start_token_id,
-                        vision_end_token_id=hf_config.vision_end_token_id,
-                        spatial_merge_size=hf_config.vision_config.
-                        spatial_merge_size,
-                        context_len=inter_data.context_lens[seq_idx],
-                    )
-
-                seq_data.mrope_position_delta = mrope_position_delta
-                inter_data.mrope_input_positions[
-                    seq_idx] = mrope_input_positions
 
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
         """Add a sequence group to the builder."""
@@ -739,20 +680,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         attn_metadata = self.attn_metadata_builder.build(
             seq_lens, query_lens, cuda_graph_pad_size, batch_size)
 
-        # Multi-modal data.
-        multi_modal_inputs_list = [
-            data.multi_modal_inputs for data in self.inter_data_list
-            if data.multi_modal_inputs is not None
-        ]
-        multi_modal_kwargs = MultiModalInputs.batch(multi_modal_inputs_list)
-
         return self.model_input_cls(
             input_tokens=input_tokens_tensor,
             input_positions=input_positions_tensor,
             attn_metadata=attn_metadata,
             seq_lens=seq_lens,
             query_lens=query_lens,
-            multi_modal_kwargs=multi_modal_kwargs,
             request_ids_to_seq_ids=request_ids_to_seq_ids,
             finished_requests_ids=self.finished_requests_ids)
 
@@ -776,7 +709,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         is_driver_worker: bool = False,
         return_hidden_states: bool = False,
         input_registry: InputRegistry = INPUT_REGISTRY,
-        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -841,10 +773,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         # Multi-modal data support
         self.input_registry = input_registry
-        self.mm_registry = mm_registry
-        self.multi_modal_input_mapper = mm_registry \
-            .create_input_mapper(model_config)
-        self.mm_registry.init_mm_limits_per_prompt(self.model_config)
 
         # Lazy initialization
         self.model: nn.Module  # Set after load_model
@@ -977,30 +905,15 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         # the number of seqs (batch_size) is chosen to maximize the number
         # of images processed.
 
-        max_mm_tokens = self.mm_registry.get_max_multimodal_tokens(
-            self.model_config)
-        if max_mm_tokens > 0:
-            max_num_seqs_orig = max_num_seqs
-            max_num_seqs = min(max_num_seqs,
-                               max_num_batched_tokens // max_mm_tokens)
-            if max_num_seqs < 1:
-                expr = (f"min({max_num_seqs_orig}, "
-                        f"{max_num_batched_tokens} // {max_mm_tokens})")
-                logger.warning(
-                    "Computed max_num_seqs (%s) to be less than 1. "
-                    "Setting it to the minimum value of 1.", expr)
-                max_num_seqs = 1
-
         batch_size = 0
         for group_id in range(max_num_seqs):
             seq_len = (max_num_batched_tokens // max_num_seqs +
                        (group_id < max_num_batched_tokens % max_num_seqs))
             batch_size += seq_len
 
-            seq_data, dummy_multi_modal_data = self.input_registry \
+            seq_data = self.input_registry \
                 .dummy_data_for_profiling(self.model_config,
-                                          seq_len,
-                                          self.mm_registry)
+                                          seq_len)
 
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
@@ -1008,7 +921,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 seq_data={group_id: seq_data},
                 sampling_params=sampling_params,
                 block_tables=None,
-                multi_modal_data=dummy_multi_modal_data,
             )
             seqs.append(seq)
 
@@ -1291,7 +1203,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         else:
             model_executable = self.model
 
-        multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
             "finished_requests_ids": model_input.finished_requests_ids,
             "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
@@ -1304,8 +1215,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 kv_caches=kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
-                **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                             device=self.device),
                 **seqlen_agnostic_kwargs)
 
         # Compute the logits in the last pipeline stage.

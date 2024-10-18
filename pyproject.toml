@@ -66,12 +66,10 @@ follow_imports = "silent"
 # move the directory here and remove it from format.sh and mypy.yaml
 files = [
   "vllm/*.py",
-  "vllm/assets",
   "vllm/entrypoints",
   "vllm/core",
   "vllm/inputs",
   "vllm/logging",
-  "vllm/multimodal",
   "vllm/platforms",
   "vllm/transformers_utils",
   "vllm/triton_utils",

@@ -123,7 +123,6 @@ class EngineArgs:
     # notice.
     tokenizer_pool_type: Union[str, Type["BaseTokenizerGroup"]] = "ray"
     tokenizer_pool_extra_config: Optional[dict] = None
-    limit_mm_per_prompt: Optional[Mapping[str, int]] = None
     device: str = 'auto'
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
@@ -153,7 +152,6 @@ class EngineArgs:
     disable_logprobs_during_spec_decoding: Optional[bool] = None
 
     disable_async_output_proc: bool = False
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
 
     def __post_init__(self):
@@ -325,10 +323,6 @@ class EngineArgs:
             help='Load model sequentially in multiple batches, '
             'to avoid RAM OOM when using tensor '
             'parallel and large models.')
-        parser.add_argument(
-            '--ray-workers-use-nsight',
-            action='store_true',
-            help='If specified, use nsight to profile Ray workers.')
         # KV cache arguments
         parser.add_argument('--block-size',
                             type=int,
@@ -345,13 +339,6 @@ class EngineArgs:
                             action='store_true',
                             help='Disables sliding window, '
                             'capping to sliding window size')
-        parser.add_argument('--use-v2-block-manager',
-                            action='store_true',
-                            help='[DEPRECATED] block manager v1 has been '
-                            'removed and SelfAttnBlockSpaceManager (i.e. '
-                            'block manager v2) is now the default. '
-                            'Setting this flag to True or False'
-                            ' has no effect on vLLM behavior.')
         parser.add_argument(
             '--num-lookahead-slots',
             type=int,
@@ -485,25 +472,6 @@ class EngineArgs:
                             'parsed into a dictionary. Ignored if '
                             'tokenizer_pool_size is 0.')
 
-        # Multimodal related configs
-        parser.add_argument(
-            '--limit-mm-per-prompt',
-            type=nullable_kvs,
-            default=EngineArgs.limit_mm_per_prompt,
-            # The default value is given in
-            # MultiModalRegistry.init_mm_limits_per_prompt
-            help=('For each multimodal plugin, limit how many '
-                  'input instances to allow for each prompt. '
-                  'Expects a comma-separated list of items, '
-                  'e.g.: `image=16,video=2` allows a maximum of 16 '
-                  'images and 2 videos per prompt. Defaults to 1 for '
-                  'each modality.'))
-        parser.add_argument(
-            '--mm-processor-kwargs',
-            default=None,
-            type=json.loads,
-            help=('Overrides for the multimodal input mapping/processing,'
-                  'e.g., image processor. For example: {"num_crops": 4}.'))
 
         parser.add_argument("--device",
                             type=str,
@@ -742,10 +710,8 @@ class EngineArgs:
             disable_sliding_window=self.disable_sliding_window,
             skip_tokenizer_init=self.skip_tokenizer_init,
             served_model_name=self.served_model_name,
-            limit_mm_per_prompt=self.limit_mm_per_prompt,
             use_async_output_proc=not self.disable_async_output_proc,
             config_format=self.config_format,
-            mm_processor_kwargs=self.mm_processor_kwargs,
         )
 
     def create_load_config(self) -> LoadConfig:

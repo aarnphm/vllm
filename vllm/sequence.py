@@ -20,7 +20,6 @@ from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
 
 if TYPE_CHECKING:
     from vllm.inputs import SingletonInputs
-    from vllm.multimodal.base import MultiModalDataDict
 
 VLLM_TOKEN_ID_ARRAY_TYPE = "l"
 
@@ -477,26 +476,6 @@ class Sequence:
         # Cache computed prompt token ids
         return cast(List[int], self.inputs.get(prompt_token_ids_key))
 
-    @property
-    def multi_modal_data(self) -> "MultiModalDataDict":
-        inputs = self.inputs
-
-        if (inputs.get("multi_modal_data")
-                and inputs.get("encoder_multi_modal_data")):
-            raise ValueError(
-                "Multi-modal data in both encoder and decoder is not supported."
-            )
-
-        return cast(
-            "MultiModalDataDict",
-            (inputs.get("multi_modal_data")
-             or inputs.get("encoder_multi_modal_data") or {}),
-        )
-
-    @property
-    def mm_processor_kwargs(self) -> Dict[str, Any]:
-        return self.inputs.get("mm_processor_kwargs") or {}
-
     def get_output_text_to_return(self, buffer_length: int,
                                   delta: bool) -> str:
         """If delta is True, only new text since the last call to
@@ -707,20 +686,6 @@ class SequenceGroup:
         # distinct from the decoder's.
         return (self.encoder_seq.prompt_token_ids
                 if self.encoder_seq is not None else None)
-
-    @property
-    def multi_modal_data(self) -> "MultiModalDataDict":
-        # All sequences in the group should have the same multi-modal data.
-        # We use the multi-modal data of an arbitrary sequence.
-        return self.seqs[0].multi_modal_data
-
-    @property
-    def mm_processor_kwargs(self) -> Dict[str, Any]:
-        # As with multi-modal data, all sequences in the group should have the
-        # same processor kwargs (i.e., mm_processor_kwargs are optionally
-        # provided per request; note that are independent of whether the model
-        # decoder-only or an encoder-decoder).
-        return self.seqs[0].mm_processor_kwargs
 
     def init_multi_step(self, num_steps: int) -> None:
         self.state.num_steps = num_steps
@@ -945,8 +910,6 @@ class SequenceGroupMetadata(
         computed_block_nums: The block numbers that are already computed,
             used in prefix caching.
         state: Internal state tied to this sequence group.
-        multi_modal_data: Multi modal data.
-        mm_processor_kwargs: Multimodal input processor / mapper overrides.
         encoder_seq_data: Optional sequence data for encoder prompt
                           (SequenceGroup.encoder_seq). Should be None
                           unless you are working with an encoder/decoder
@@ -968,10 +931,6 @@ class SequenceGroupMetadata(
     computed_block_nums: Optional[List[int]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
-    # "MultiModalDataDict" types. We have to use Any due to msgspec
-    # doesn't allow to have union of 2 different dicts.
-    multi_modal_data: Optional[Any] = None
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[List[int]] = None
     token_chunk_size: Optional[int] = None
