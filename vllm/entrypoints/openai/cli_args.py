@@ -10,51 +10,11 @@ import ssl
 from typing import List, Optional, Sequence, Union
 
 from vllm.engine.arg_utils import AsyncEngineArgs, nullable_str
-from vllm.entrypoints.openai.serving_engine import (LoRAModulePath,
-                                                    PromptAdapterPath)
+from vllm.entrypoints.chat_utils import validate_chat_template
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.utils import FlexibleArgumentParser
 
 
-class LoRAParserAction(argparse.Action):
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Optional[Union[str, Sequence[str]]],
-        option_string: Optional[str] = None,
-    ):
-        if values is None:
-            values = []
-        if isinstance(values, str):
-            raise TypeError("Expected values to be a list")
-
-        lora_list: List[LoRAModulePath] = []
-        for item in values:
-            name, path = item.split('=')
-            lora_list.append(LoRAModulePath(name, path))
-        setattr(namespace, self.dest, lora_list)
-
-
-class PromptAdapterParserAction(argparse.Action):
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Optional[Union[str, Sequence[str]]],
-        option_string: Optional[str] = None,
-    ):
-        if values is None:
-            values = []
-        if isinstance(values, str):
-            raise TypeError("Expected values to be a list")
-
-        adapter_list: List[PromptAdapterPath] = []
-        for item in values:
-            name, path = item.split('=')
-            adapter_list.append(PromptAdapterPath(name, path))
-        setattr(namespace, self.dest, adapter_list)
 
 
 def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -89,22 +49,6 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
                         default=None,
                         help="If provided, the server will require this key "
                         "to be presented in the header.")
-    parser.add_argument(
-        "--lora-modules",
-        type=nullable_str,
-        default=None,
-        nargs='+',
-        action=LoRAParserAction,
-        help="LoRA module configurations in the format name=path. "
-        "Multiple modules can be specified.")
-    parser.add_argument(
-        "--prompt-adapters",
-        type=nullable_str,
-        default=None,
-        nargs='+',
-        action=PromptAdapterParserAction,
-        help="Prompt adapter configurations in the format name=path. "
-        "Multiple adapters can be specified.")
     parser.add_argument("--chat-template",
                         type=nullable_str,
                         default=None,
@@ -171,15 +115,26 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Enable auto tool choice for supported models. Use --tool-call-parser"
         "to specify which parser to use")
 
+    valid_tool_parsers = ToolParserManager.tool_parsers.keys()
     parser.add_argument(
         "--tool-call-parser",
         type=str,
-        choices=["mistral", "hermes"],
+        metavar="{" + ",".join(valid_tool_parsers) + "} or name registered in "
+        "--tool-parser-plugin",
         default=None,
         help=
         "Select the tool call parser depending on the model that you're using."
         " This is used to parse the model-generated tool call into OpenAI API "
         "format. Required for --enable-auto-tool-choice.")
+
+    parser.add_argument(
+        "--tool-parser-plugin",
+        type=str,
+        default="",
+        help=
+        "Special the tool parser plugin write to parse the model-generated tool"
+        " into OpenAI API format, the name register in this plugin can be used "
+        "in --tool-call-parser.")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
 
@@ -190,7 +145,28 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
                         'ID numbers being printed in log.'
                         '\n\nDefault: Unlimited')
 
+    parser.add_argument(
+        "--disable-fastapi-docs",
+        action='store_true',
+        default=False,
+        help="Disable FastAPI's OpenAPI schema, Swagger UI, and ReDoc endpoint"
+    )
+
     return parser
+
+
+def validate_parsed_serve_args(args: argparse.Namespace):
+    """Quick checks for model serve args that raise prior to loading."""
+    if hasattr(args, "subparser") and args.subparser != "serve":
+        return
+
+    # Ensure that the chat template is valid; raises if it likely isn't
+    validate_chat_template(args.chat_template)
+
+    # Enable auto tool needs a tool call parser to be valid
+    if args.enable_auto_tool_choice and not args.tool_call_parser:
+        raise TypeError("Error: --enable-auto-tool-choice requires "
+                        "--tool-call-parser")
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:

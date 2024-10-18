@@ -17,14 +17,7 @@ from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm.transformers_utils.configs import (ChatGLMConfig, DbrxConfig,
-                                             EAGLEConfig, ExaoneConfig,
-                                             InternVLChatConfig, JAISConfig,
-                                             MedusaConfig, MllamaConfig,
-                                             MLPSpeculatorConfig, MPTConfig,
-                                             NemotronConfig, NVLM_D_Config,
-                                             RWConfig, SolarConfig,
-                                             UltravoxConfig)
+from vllm.transformers_utils.configs import MedusaConfig, MllamaConfig, MLPSpeculatorConfig
 # yapf: enable
 from vllm.transformers_utils.utils import check_gguf_file
 
@@ -42,21 +35,8 @@ _CONFIG_REGISTRY_OVERRIDE_HF: Dict[str, Type[PretrainedConfig]] = {
 }
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    "chatglm": ChatGLMConfig,
-    "dbrx": DbrxConfig,
-    "mpt": MPTConfig,
-    "RefinedWeb": RWConfig,  # For tiiuae/falcon-40b(-instruct)
-    "RefinedWebModel": RWConfig,  # For tiiuae/falcon-7b(-instruct)
-    "jais": JAISConfig,
     "mlp_speculator": MLPSpeculatorConfig,
     "medusa": MedusaConfig,
-    "eagle": EAGLEConfig,
-    "exaone": ExaoneConfig,
-    "internvl_chat": InternVLChatConfig,
-    "nemotron": NemotronConfig,
-    "NVLM_D": NVLM_D_Config,
-    "solar": SolarConfig,
-    "ultravox": UltravoxConfig,
     **_CONFIG_REGISTRY_OVERRIDE_HF
 }
 

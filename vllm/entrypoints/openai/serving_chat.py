@@ -26,7 +26,6 @@ from vllm.entrypoints.openai.protocol import (
     ToolCall, UsageInfo)
 from vllm.entrypoints.openai.serving_engine import (BaseModelPath,
                                                     OpenAIServing,
-                                                    PromptAdapterPath,
                                                     TextTokensPrompt)
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 from vllm.inputs import TokensPrompt

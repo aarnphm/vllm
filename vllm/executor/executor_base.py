@@ -1,10 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Set, Tuple
 
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
                          ModelConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         SchedulerConfig, SpeculativeConfig)
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 

@@ -47,11 +47,7 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               TokenizeResponse)
 # yapf: enable
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from vllm.entrypoints.openai.serving_engine import BaseModelPath
-from vllm.entrypoints.openai.serving_tokenization import (
-    OpenAIServingTokenization)
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
@@ -239,18 +235,6 @@ def mount_metrics(app: FastAPI):
 
 def chat(request: Request) -> OpenAIServingChat:
     return request.app.state.openai_serving_chat
-
-
-def completion(request: Request) -> OpenAIServingCompletion:
-    return request.app.state.openai_serving_completion
-
-
-def tokenization(request: Request) -> OpenAIServingTokenization:
-    return request.app.state.openai_serving_tokenization
-
-
-def embedding(request: Request) -> OpenAIServingEmbedding:
-    return request.app.state.openai_serving_embedding
 
 
 def engine_client(request: Request) -> EngineClient:

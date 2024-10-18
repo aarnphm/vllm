@@ -1,8 +1,8 @@
 from typing import List, Optional
 
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
                          ModelConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig)
+                         SchedulerConfig)
 from vllm.sequence import SequenceGroupMetadata
 from vllm.worker.model_runner import (ModelInputForGPUWithSamplingMetadata,
                                       ModelRunner)

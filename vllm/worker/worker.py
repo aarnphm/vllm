@@ -9,21 +9,17 @@ import torch.distributed
 import vllm.envs as envs
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
                          ModelConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         SchedulerConfig, SpeculativeConfig)
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.worker.cache_engine import CacheEngine
-from vllm.worker.embedding_model_runner import EmbeddingModelRunner
-from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.worker_base import LocalOrDistributedWorkerBase, WorkerInput
 
@@ -178,13 +174,6 @@ class Worker(LocalOrDistributedWorkerBase):
             pattern=pattern,
             max_size=max_size,
         )
-
-    def save_tensorized_model(
-        self,
-        tensorizer_config: TensorizerConfig,
-    ) -> None:
-        self.model_runner.save_tensorized_model(
-            tensorizer_config=tensorizer_config, )
 
     @torch.inference_mode()
     def determine_num_available_blocks(self) -> Tuple[int, int]:

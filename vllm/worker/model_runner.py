@@ -21,8 +21,7 @@ from vllm.attention.backends.utils import CommonAttentionState
 from vllm.compilation.compile_context import set_compile_context
 from vllm.compilation.levels import CompilationLevel
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
-                         ModelConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig)
+                         ModelConfig, ParallelConfig, SchedulerConfig)
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.distributed import get_pp_group
 from vllm.distributed.parallel_state import graph_capture
@@ -33,7 +32,6 @@ from vllm.model_executor import SamplingMetadata, SamplingMetadataCache
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
@@ -929,16 +927,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             path,
             pattern=pattern,
             max_size=max_size,
-        )
-
-    def save_tensorized_model(
-        self,
-        tensorizer_config: TensorizerConfig,
-    ) -> None:
-        from vllm.model_executor.model_loader.loader import TensorizerLoader
-        TensorizerLoader.save_model(
-            self.model,
-            tensorizer_config=tensorizer_config,
         )
 
     def get_max_block_per_batch(self) -> int:

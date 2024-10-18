@@ -14,7 +14,7 @@ from typing_extensions import TypeVar
 import vllm.envs as envs
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, ModelConfig,
-                         ParallelConfig, PromptAdapterConfig, SchedulerConfig,
+                         ParallelConfig, SchedulerConfig,
                          SpeculativeConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
                                  SchedulerOutputs)
@@ -1716,9 +1716,6 @@ class LLMEngine:
                     SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_EXECUTE,
                     metrics.model_execute_time)
 
-    def is_encoder_decoder_model(self):
-        return self.input_preprocessor.is_encoder_decoder_model()
-
     def is_embedding_model(self):
         return self.model_config.is_embedding_model
 
@@ -1728,8 +1725,6 @@ class LLMEngine:
             # For encoder-decoder multimodal models, the max_prompt_len
             # restricts the decoder prompt length
             prompt_ids = inputs.get("prompt_token_ids")
-        elif self.is_encoder_decoder_model():
-            prompt_ids = inputs.get("encoder_prompt_token_ids")
         else:
             prompt_ids = inputs.get("prompt_token_ids")
 

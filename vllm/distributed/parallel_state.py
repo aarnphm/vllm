@@ -7,7 +7,7 @@ It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
 
 - call `init_distributed_environment` to initialize the distributed environment.
-- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to 
+- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to
  initialize the model parallel groups.
 
 - any code dealing with the distributed stuff
@@ -223,12 +223,6 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
-
-        from vllm.distributed.device_communicators.tpu_communicator import (
-            TpuCommunicator)
-        self.tpu_communicator: Optional[TpuCommunicator] = None
-        if use_tpu_communicator and self.world_size > 1:
-            self.tpu_communicator = TpuCommunicator(group=self.cpu_group)
 
         from vllm.distributed.device_communicators.shm_broadcast import (
             MessageQueue)

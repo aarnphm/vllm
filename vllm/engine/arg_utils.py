@@ -10,7 +10,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import (CacheConfig, ConfigFormat, DecodingConfig,
                          DeviceConfig, EngineConfig, LoadConfig, LoadFormat,
-                         ModelConfig, ParallelConfig, PromptAdapterConfig, SchedulerConfig,
+                         ModelConfig, ParallelConfig, SchedulerConfig,
                          SpeculativeConfig, TokenizerPoolConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
@@ -127,7 +127,6 @@ class EngineArgs:
     device: str = 'auto'
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
-    ray_workers_use_nsight: bool = False
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
     model_loader_extra_config: Optional[dict] = None
@@ -153,7 +152,6 @@ class EngineArgs:
     typical_acceptance_sampler_posterior_alpha: Optional[float] = None
     disable_logprobs_during_spec_decoding: Optional[bool] = None
 
-    collect_detailed_traces: Optional[str] = None
     disable_async_output_proc: bool = False
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
@@ -310,10 +308,6 @@ class EngineArgs:
             help='Backend to use for distributed serving. When more than 1 GPU '
             'is used, will be automatically set to "ray" if installed '
             'or "mp" (multiprocessing) otherwise.')
-        parser.add_argument(
-            '--worker-use-ray',
-            action='store_true',
-            help='Deprecated, use --distributed-executor-backend=ray.')
         parser.add_argument('--pipeline-parallel-size',
                             '-pp',
                             type=int,
@@ -816,7 +810,6 @@ class EngineArgs:
                 self.tokenizer_pool_type,
                 self.tokenizer_pool_extra_config,
             ),
-            ray_workers_use_nsight=self.ray_workers_use_nsight,
             distributed_executor_backend=self.distributed_executor_backend)
 
         max_model_len = model_config.max_model_len
@@ -916,15 +909,6 @@ class EngineArgs:
 
         decoding_config = DecodingConfig(
             guided_decoding_backend=self.guided_decoding_backend)
-
-        detailed_trace_modules = []
-        if self.collect_detailed_traces is not None:
-            detailed_trace_modules = self.collect_detailed_traces.split(",")
-        for m in detailed_trace_modules:
-            if m not in ALLOWED_DETAILED_TRACE_MODULES:
-                raise ValueError(
-                    f"Invalid module {m} in collect_detailed_traces. "
-                    f"Valid modules are {ALLOWED_DETAILED_TRACE_MODULES}")
 
         return EngineConfig(
             model_config=model_config,

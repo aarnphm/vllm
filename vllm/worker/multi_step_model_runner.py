@@ -22,8 +22,6 @@ from vllm.worker.model_runner_base import (
     _init_frozen_model_input_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict)
 
-from ..model_executor.model_loader.tensorizer import TensorizerConfig
-
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
@@ -646,10 +644,6 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
     ) -> None:
         return self._base_model_runner.save_sharded_state(
             path, pattern, max_size)
-
-    def save_tensorized_model(self,
-                              tensorizer_config: TensorizerConfig) -> None:
-        return self._base_model_runner.save_tensorized_model(tensorizer_config)
 
     def profile_run(self) -> None:
         return self._base_model_runner.profile_run()

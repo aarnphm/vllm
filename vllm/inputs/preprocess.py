@@ -157,14 +157,12 @@ class InputPreprocessor:
 
         return decoder_input_ids
 
-    def _tokenize_prompt(self, prompt: str, request_id: str) -> List[int]: """
+    def _tokenize_prompt(self, prompt: str, request_id: str) -> List[int]:
+        """
         Apply the model's tokenizer to a text prompt, returning the
         corresponding token IDs.
         """
-        tokenizer = self.get_tokenizer_group()
-
-        return tokenizer.encode(request_id=request_id,
-                                prompt=prompt)
+        return self.get_tokenizer_group().encode(request_id=request_id, prompt=prompt)
 
     async def _tokenize_prompt_async(self, prompt: str, request_id: str) -> List[int]:
         """Async version of :meth:`_tokenize_prompt`."""

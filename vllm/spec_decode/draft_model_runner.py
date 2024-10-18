@@ -18,8 +18,7 @@ except (ModuleNotFoundError, ImportError) as err:
         "CUDA and ROCm flash attention backend.") from err
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
-                         ModelConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig)
+                         ModelConfig, ParallelConfig, SchedulerConfig)
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalInputs
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
