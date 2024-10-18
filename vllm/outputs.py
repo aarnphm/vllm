@@ -5,7 +5,6 @@ from typing import Sequence as GenericSequence
 from typing import Union
 
 from vllm.inputs import PromptType
-from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind
 from vllm.sequence import (PromptLogprobs, RequestMetrics, SampleLogprobs,
                            SequenceGroup, SequenceStatus)
@@ -27,7 +26,6 @@ class CompletionOutput:
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
             including encountering the EOS token.
-        lora_request: The LoRA request that was used to generate the output.
     """
 
     index: int
@@ -37,7 +35,6 @@ class CompletionOutput:
     logprobs: Optional[SampleLogprobs]
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
-    lora_request: Optional[LoRARequest] = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -83,8 +80,7 @@ class RequestOutput:
         outputs: The output sequences of the request.
         finished: Whether the whole request is finished.
         metrics: Metrics associated with the request.
-        lora_request: The LoRA request that was used to generate the output.
-        encoder_prompt: The encoder prompt string of the request; 
+        encoder_prompt: The encoder prompt string of the request;
                         None if decoder-only
         encoder_prompt_token_ids: The token IDs of the encoder prompt;
                                   None if decoder-only
@@ -99,7 +95,6 @@ class RequestOutput:
         outputs: List[CompletionOutput],
         finished: bool,
         metrics: Optional[RequestMetrics] = None,
-        lora_request: Optional[LoRARequest] = None,
         encoder_prompt: Optional[str] = None,
         encoder_prompt_token_ids: Optional[List[int]] = None,
     ) -> None:
@@ -110,7 +105,6 @@ class RequestOutput:
         self.outputs = outputs
         self.finished = finished
         self.metrics = metrics
-        self.lora_request = lora_request
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
 
@@ -236,7 +230,7 @@ class RequestOutput:
 
         init_args = (seq_group.request_id, prompt, prompt_token_ids,
                      prompt_logprobs, outputs, finished, seq_group.metrics,
-                     seq_group.lora_request, encoder_prompt,
+                     encoder_prompt,
                      encoder_prompt_token_ids)
 
         if use_cache:
@@ -257,8 +251,7 @@ class RequestOutput:
                 f"prompt_logprobs={self.prompt_logprobs}, "
                 f"outputs={self.outputs}, "
                 f"finished={self.finished}, "
-                f"metrics={self.metrics}, "
-                f"lora_request={self.lora_request})")
+                f"metrics={self.metrics}")
 
 
 class EmbeddingRequestOutput:

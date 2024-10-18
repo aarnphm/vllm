@@ -8,11 +8,9 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Set, Tuple, Union
 
-from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.config import CacheConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
@@ -139,38 +137,10 @@ class SchedulerOutputs:
         # Swap in and swap out should never happen at the same time.
         assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
 
-        self.num_loras: int = len(self.lora_requests)
-        if self.num_loras > 0:
-            self._sort_by_lora_ids()
-
-        self.num_prompt_adapters: int = len(self.prompt_adapter_requests)
-
     def is_empty(self) -> bool:
         # NOTE: We do not consider the ignored sequence groups.
         return (not self.scheduled_seq_groups and not self.blocks_to_swap_in
                 and not self.blocks_to_swap_out and not self.blocks_to_copy)
-
-    def _sort_by_lora_ids(self):
-        self.scheduled_seq_groups = sorted(
-            self.scheduled_seq_groups,
-            key=lambda g: (g.seq_group.lora_int_id, g.seq_group.request_id))
-
-    @property
-    def lora_requests(self) -> Set[LoRARequest]:
-        return {
-            g.seq_group.lora_request
-            for g in self.scheduled_seq_groups
-            if g.seq_group.lora_request is not None
-        }
-
-    @property
-    def prompt_adapter_requests(self) -> Set[PromptAdapterRequest]:
-        return {
-            g.seq_group.prompt_adapter_request
-            for g in self.scheduled_seq_groups
-            if g.seq_group.prompt_adapter_request is not None
-        }
-
 
 @dataclass
 class SchedulerRunningOutputs:
@@ -301,16 +271,11 @@ class Scheduler:
         self,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
-        lora_config: Optional[LoRAConfig],
         pipeline_parallel_size: int = 1,
         output_proc_callback: Optional[Callable] = None,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
-        # Note for LoRA scheduling: the current policy is extremely
-        # simple and NOT fair. It can lead to starvation of some
-        # LoRAs. This should be improved in the future.
-        self.lora_config = lora_config
 
         version = "selfattn"
         if (self.scheduler_config.embedding_mode
@@ -398,10 +363,6 @@ class Scheduler:
     @property
     def next_cache_id(self):
         return (self.cache_id + 1) % self.num_cache_iters
-
-    @property
-    def lora_enabled(self) -> bool:
-        return bool(self.lora_config)
 
     @property
     def num_decoding_tokens_per_seq(self) -> int:
@@ -492,7 +453,6 @@ class Scheduler:
     def _schedule_running(
         self,
         budget: SchedulingBudget,
-        curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
     ) -> SchedulerRunningOutputs:
         """Schedule sequence groups that are running.
@@ -502,13 +462,11 @@ class Scheduler:
         Args:
             budget: The scheduling budget. The argument is in-place updated
                 when any decodes are preempted.
-            curr_loras: Currently batched lora request ids. The argument is
-                in-place updated when any decodes are preempted.
             enable_chunking: If True, seq group can be chunked and only a
                 chunked number of tokens are scheduled  if
                 `budget.num_batched_tokens` has not enough capacity to schedule
                 all tokens.
-    
+
         Returns:
             SchedulerRunningOutputs.
         """
@@ -567,10 +525,6 @@ class Scheduler:
                 num_running_seqs = seq_group.get_max_num_running_seqs()
                 budget.subtract_num_seqs(seq_group.request_id,
                                          num_running_seqs)
-
-                if (curr_loras is not None and seq_group.lora_int_id > 0
-                        and seq_group.lora_int_id in curr_loras):
-                    curr_loras.remove(seq_group.lora_int_id)
 
                 # Determine victim sequence
                 cont_loop = True
@@ -635,8 +589,6 @@ class Scheduler:
                 if enable_chunking:
                     num_running_seqs = seq_group.get_max_num_running_seqs()
                     budget.add_num_seqs(seq_group.request_id, num_running_seqs)
-                if curr_loras is not None and seq_group.lora_int_id > 0:
-                    curr_loras.add(seq_group.lora_int_id)
 
         self._scheduler_running_outputs_cache[self.next_cache_id].reset()
         self._scheduled_seq_group_cache[self.next_cache_id].reset()
@@ -646,7 +598,6 @@ class Scheduler:
     def _schedule_swapped(
         self,
         budget: SchedulingBudget,
-        curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
     ) -> SchedulerSwappedInOutputs:
         """Schedule sequence groups that are swapped out.
@@ -658,8 +609,6 @@ class Scheduler:
         Args:
             budget: The scheduling budget. The argument is in-place updated
                 when any requests are swapped in.
-            curr_loras: Currently batched lora request ids. The argument is
-                in-place updated when any requests are swapped in.
             enable_chunking: If True, seq group can be chunked and only a
                 chunked number of tokens are scheduled  if
                 `budget.num_batched_tokens` has not enough capacity to schedule
@@ -699,19 +648,6 @@ class Scheduler:
                 swapped_queue.popleft()
                 continue
 
-            lora_int_id = 0
-            if self.lora_enabled:
-                lora_int_id = seq_group.lora_int_id
-                assert curr_loras is not None
-                assert self.lora_config is not None
-                if (lora_int_id > 0 and (lora_int_id not in curr_loras)
-                        and len(curr_loras) >= self.lora_config.max_loras):
-                    # We don't have a space for another LoRA, so
-                    # we ignore this request for now.
-                    leftover_swapped.appendleft(seq_group)
-                    swapped_queue.popleft()
-                    continue
-
             # The total number of sequences in the RUNNING state should not
             # exceed the maximum number of sequences.
             num_new_seqs = seq_group.get_max_num_running_seqs()
@@ -724,8 +660,6 @@ class Scheduler:
                                                num_new_seqs=num_new_seqs)):
                 break
 
-            if lora_int_id > 0 and curr_loras is not None:
-                curr_loras.add(lora_int_id)
             swapped_queue.popleft()
             self._swap_in(seq_group, blocks_to_swap_in)
             self._append_slots(seq_group, blocks_to_copy, enable_chunking)
@@ -760,13 +694,7 @@ class Scheduler:
             prompt_limit = min(self.scheduler_config.max_model_len,
                                self.scheduler_config.max_num_batched_tokens)
 
-        # Model is fine tuned with long context. Return the fine tuned max_len.
-        if (seq_group.lora_request
-                and seq_group.lora_request.long_lora_max_len):
-            assert prompt_limit <= seq_group.lora_request.long_lora_max_len
-            return seq_group.lora_request.long_lora_max_len
-        else:
-            return prompt_limit
+        return prompt_limit
 
     def _get_priority(self,
                       seq_group: SequenceGroup) -> Tuple[Optional[int], float]:
@@ -844,7 +772,6 @@ class Scheduler:
     def _schedule_prefills(
         self,
         budget: SchedulingBudget,
-        curr_loras: Optional[Set[int]],
         enable_chunking: bool = False,
     ) -> SchedulerPrefillOutputs:
         """Schedule sequence groups that are in prefill stage.
@@ -860,8 +787,6 @@ class Scheduler:
         Args:
             budget: The scheduling budget. The argument is in-place updated
                 when any requests are scheduled.
-            curr_loras: Currently batched lora request ids. The argument is
-                in-place updated when any requests are scheduled.
             enable_chunking: If True, seq group can be chunked and only a
                 chunked number of tokens are scheduled  if
                 `budget.num_batched_tokens` has not enough capacity to schedule
@@ -922,20 +847,6 @@ class Scheduler:
                 waiting_queue.popleft()
                 continue
 
-            lora_int_id = 0
-            if self.lora_enabled:
-                lora_int_id = seq_group.lora_int_id
-                assert curr_loras is not None
-                assert self.lora_config is not None
-                if (self.lora_enabled and lora_int_id > 0
-                        and lora_int_id not in curr_loras
-                        and len(curr_loras) >= self.lora_config.max_loras):
-                    # We don't have a space for another LoRA, so
-                    # we ignore this request for now.
-                    leftover_waiting_sequences.appendleft(seq_group)
-                    waiting_queue.popleft()
-                    continue
-
             num_new_seqs = seq_group.get_max_num_running_seqs()
             if (num_new_tokens == 0
                     or not budget.can_schedule(num_new_tokens=num_new_tokens,
@@ -943,8 +854,6 @@ class Scheduler:
                 break
 
             # Can schedule this request.
-            if curr_loras is not None and lora_int_id > 0:
-                curr_loras.add(lora_int_id)
             waiting_queue.popleft()
             self._allocate_and_set_running(seq_group)
 
@@ -984,7 +893,7 @@ class Scheduler:
 
     def _schedule_default(self) -> SchedulerOutputs:
         """Schedule queued requests.
-        
+
         The current policy is designed to optimize the throughput. First,
         it batches as many prefill requests as possible. And it schedules
         decodes. If there's a pressure on GPU memory, decode requests can
@@ -1000,9 +909,6 @@ class Scheduler:
         for seq_group in self.running:
             budget.add_num_seqs(seq_group.request_id,
                                 seq_group.get_max_num_running_seqs())
-        curr_loras = set(
-            seq_group.lora_int_id for seq_group in self.running
-            if seq_group.lora_int_id > 0) if self.lora_enabled else None
 
         prefills = SchedulerPrefillOutputs.create_empty()
         running_scheduled = SchedulerRunningOutputs.create_empty()
@@ -1010,9 +916,7 @@ class Scheduler:
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
+            prefills = self._schedule_prefills(budget, enable_chunking=False)
 
         if len(prefills.seq_groups
                ) == 0 and self.scheduler_config.policy == "priority":
@@ -1022,15 +926,13 @@ class Scheduler:
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
         # only contains decode requests, not chunked prefills.
         if len(prefills.seq_groups) == 0:
-            running_scheduled = self._schedule_running(budget,
-                                                       curr_loras,
-                                                       enable_chunking=False)
+            running_scheduled = self._schedule_running(budget, enable_chunking=False)
 
             # If any sequence group is preempted, do not swap in any sequence
             # group. because it means there's no slot for new running requests.
             if len(running_scheduled.preempted) + len(
                     running_scheduled.swapped_out) == 0:
-                swapped_in = self._schedule_swapped(budget, curr_loras)
+                swapped_in = self._schedule_swapped(budget)
 
         assert (budget.num_batched_tokens <=
                 self.scheduler_config.max_num_batched_tokens)
@@ -1088,7 +990,7 @@ class Scheduler:
 
     def _schedule_chunked_prefill(self) -> SchedulerOutputs:
         """Schedule queued requests.
-        
+
         Chunked prefill allows to chunk prefill requests, batch them together
         with decode requests. This policy 1. schedule as many decoding requests
         as possible. 2. schedule chunked prefill requests that are not
@@ -1104,26 +1006,21 @@ class Scheduler:
             token_budget=self.scheduler_config.max_num_batched_tokens,
             max_num_seqs=self.scheduler_config.max_num_seqs,
         )
-        curr_loras: Set[int] = set()
 
         prefills = SchedulerPrefillOutputs.create_empty()
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
         # Decoding should be always scheduled first by fcfs.
-        running_scheduled = self._schedule_running(budget,
-                                                   curr_loras,
-                                                   enable_chunking=True)
+        running_scheduled = self._schedule_running(budget, enable_chunking=True)
 
         # Schedule swapped out requests.
         # If preemption happens, it means we don't have space for swap-in.
         if len(running_scheduled.preempted) + len(
                 running_scheduled.swapped_out) == 0:
-            swapped_in = self._schedule_swapped(budget, curr_loras)
+            swapped_in = self._schedule_swapped(budget)
 
         # Schedule new prefills.
-        prefills = self._schedule_prefills(budget,
-                                           curr_loras,
-                                           enable_chunking=True)
+        prefills = self._schedule_prefills(budget, enable_chunking=True)
 
         assert (budget.num_batched_tokens <=
                 self.scheduler_config.max_num_batched_tokens)
@@ -1298,7 +1195,6 @@ class Scheduler:
                     do_sample=do_sample,
                     pooling_params=seq_group.pooling_params,
                     token_chunk_size=token_chunk_size,
-                    lora_request=seq_group.lora_request,
                     computed_block_nums=common_computed_block_nums,
                     encoder_seq_data=encoder_seq_data,
                     cross_block_table=cross_block_table,
@@ -1310,7 +1206,6 @@ class Scheduler:
                     multi_modal_data=seq_group.multi_modal_data
                     if scheduler_outputs.num_prefill_groups > 0 else None,
                     mm_processor_kwargs=seq_group.mm_processor_kwargs,
-                    prompt_adapter_request=seq_group.prompt_adapter_request,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for

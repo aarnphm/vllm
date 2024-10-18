@@ -5,7 +5,6 @@ from typing import Any, Awaitable, Dict, List, Optional, Set, Tuple, Union
 from vllm.executor.executor_base import ExecutorAsyncBase
 from vllm.executor.gpu_executor import GPUExecutor
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 
@@ -93,30 +92,6 @@ class DistributedGPUExecutor(GPUExecutor):
         # Ensure that workers exit model loop cleanly
         # (this will raise otherwise)
         self._wait_for_tasks_completion(parallel_worker_tasks)
-
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        assert lora_request.lora_int_id > 0, "lora_id must be greater than 0."
-        return self._run_workers(
-            "add_lora",
-            lora_request=lora_request,
-        )
-
-    def remove_lora(self, lora_id: int) -> bool:
-        assert lora_id > 0, "lora_id must be greater than 0."
-        return self._run_workers(
-            "remove_lora",
-            lora_id=lora_id,
-        )
-
-    def pin_lora(self, lora_id: int) -> bool:
-        assert lora_id > 0, "lora_id must be greater than 0."
-        return self._run_workers(
-            "pin_lora",
-            lora_id=lora_id,
-        )
-
-    def list_loras(self) -> Set[int]:
-        return self._run_workers("list_loras")
 
     def save_sharded_state(
         self,

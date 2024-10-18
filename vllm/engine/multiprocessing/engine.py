@@ -9,7 +9,7 @@ import cloudpickle
 import zmq
 
 from vllm import AsyncEngineArgs, LLMEngine, SamplingParams
-from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
+from vllm.config import (DecodingConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig)
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -27,8 +27,7 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 
-CONFIG_TYPE = Union[ModelConfig, DecodingConfig, ParallelConfig,
-                    SchedulerConfig, LoRAConfig]
+CONFIG_TYPE = Union[ModelConfig, DecodingConfig, ParallelConfig, SchedulerConfig]
 
 logger = init_logger(__name__)
 
@@ -40,12 +39,12 @@ class MQLLMEngine:
     """A multiprocessing wrapper for :class:`LLMEngine`.
 
     This class is used to wrap the :class:`LLMEngine` class to enable use
-    in concurrnet manner. It runs a background loop and uses zeromq to 
+    in concurrnet manner. It runs a background loop and uses zeromq to
     receive new requests and stream outputs incrementally via ipc.
-    
+
     The :class:`LLMEngine` generate or encode process is kicked off when a new
     RPCProcessRequest is received by the input_socket.
-    
+
     The self.engine_loop checks the input_socket for new requests,
     adds them to the LLMEngine if there are any, calls the internal
     :class:`LLMEngine.step()`, and sends the RequestOutputs back over
@@ -281,9 +280,7 @@ class MQLLMEngine:
                 request_id=request_id,
                 prompt=request.prompt,
                 params=request.params,
-                lora_request=request.lora_request,
                 trace_headers=request.trace_headers,
-                prompt_adapter_request=request.prompt_adapter_request,
                 priority=request.priority)
 
             if self.log_requests:

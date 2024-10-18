@@ -10,8 +10,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import (CacheConfig, ConfigFormat, DecodingConfig,
                          DeviceConfig, EngineConfig, LoadConfig, LoadFormat,
-                         LoRAConfig, ModelConfig, ObservabilityConfig,
-                         ParallelConfig, PromptAdapterConfig, SchedulerConfig,
+                         ModelConfig, ParallelConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig, TokenizerPoolConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
@@ -29,11 +28,6 @@ ALLOWED_DETAILED_TRACE_MODULES = ["model", "worker", "all"]
 DEVICE_OPTIONS = [
     "auto",
     "cuda",
-    "neuron",
-    "cpu",
-    "openvino",
-    "tpu",
-    "xpu",
 ]
 
 
@@ -95,7 +89,6 @@ class EngineArgs:
     quantization_param_path: Optional[str] = None
     seed: int = 0
     max_model_len: Optional[int] = None
-    worker_use_ray: bool = False
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -107,7 +100,6 @@ class EngineArgs:
     block_size: int = 16
     enable_prefix_caching: bool = False
     disable_sliding_window: bool = False
-    use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
@@ -132,17 +124,6 @@ class EngineArgs:
     tokenizer_pool_type: Union[str, Type["BaseTokenizerGroup"]] = "ray"
     tokenizer_pool_extra_config: Optional[dict] = None
     limit_mm_per_prompt: Optional[Mapping[str, int]] = None
-    enable_lora: bool = False
-    max_loras: int = 1
-    max_lora_rank: int = 16
-    enable_prompt_adapter: bool = False
-    max_prompt_adapters: int = 1
-    max_prompt_adapter_token: int = 0
-    fully_sharded_loras: bool = False
-    lora_extra_vocab_size: int = 256
-    long_lora_scaling_factors: Optional[Tuple[float]] = None
-    lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
-    max_cpu_loras: Optional[int] = None
     device: str = 'auto'
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
@@ -170,13 +151,10 @@ class EngineArgs:
     spec_decoding_acceptance_method: str = 'rejection_sampler'
     typical_acceptance_sampler_posterior_threshold: Optional[float] = None
     typical_acceptance_sampler_posterior_alpha: Optional[float] = None
-    qlora_adapter_name_or_path: Optional[str] = None
     disable_logprobs_during_spec_decoding: Optional[bool] = None
 
-    otlp_traces_endpoint: Optional[str] = None
     collect_detailed_traces: Optional[str] = None
     disable_async_output_proc: bool = False
-    override_neuron_config: Optional[Dict[str, Any]] = None
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
 
@@ -533,69 +511,6 @@ class EngineArgs:
             help=('Overrides for the multimodal input mapping/processing,'
                   'e.g., image processor. For example: {"num_crops": 4}.'))
 
-        # LoRA related configs
-        parser.add_argument('--enable-lora',
-                            action='store_true',
-                            help='If True, enable handling of LoRA adapters.')
-        parser.add_argument('--max-loras',
-                            type=int,
-                            default=EngineArgs.max_loras,
-                            help='Max number of LoRAs in a single batch.')
-        parser.add_argument('--max-lora-rank',
-                            type=int,
-                            default=EngineArgs.max_lora_rank,
-                            help='Max LoRA rank.')
-        parser.add_argument(
-            '--lora-extra-vocab-size',
-            type=int,
-            default=EngineArgs.lora_extra_vocab_size,
-            help=('Maximum size of extra vocabulary that can be '
-                  'present in a LoRA adapter (added to the base '
-                  'model vocabulary).'))
-        parser.add_argument(
-            '--lora-dtype',
-            type=str,
-            default=EngineArgs.lora_dtype,
-            choices=['auto', 'float16', 'bfloat16', 'float32'],
-            help=('Data type for LoRA. If auto, will default to '
-                  'base model dtype.'))
-        parser.add_argument(
-            '--long-lora-scaling-factors',
-            type=nullable_str,
-            default=EngineArgs.long_lora_scaling_factors,
-            help=('Specify multiple scaling factors (which can '
-                  'be different from base model scaling factor '
-                  '- see eg. Long LoRA) to allow for multiple '
-                  'LoRA adapters trained with those scaling '
-                  'factors to be used at the same time. If not '
-                  'specified, only adapters trained with the '
-                  'base model scaling factor are allowed.'))
-        parser.add_argument(
-            '--max-cpu-loras',
-            type=int,
-            default=EngineArgs.max_cpu_loras,
-            help=('Maximum number of LoRAs to store in CPU memory. '
-                  'Must be >= than max_num_seqs. '
-                  'Defaults to max_num_seqs.'))
-        parser.add_argument(
-            '--fully-sharded-loras',
-            action='store_true',
-            help=('By default, only half of the LoRA computation is '
-                  'sharded with tensor parallelism. '
-                  'Enabling this will use the fully sharded layers. '
-                  'At high sequence length, max rank or '
-                  'tensor parallel size, this is likely faster.'))
-        parser.add_argument('--enable-prompt-adapter',
-                            action='store_true',
-                            help='If True, enable handling of PromptAdapters.')
-        parser.add_argument('--max-prompt-adapters',
-                            type=int,
-                            default=EngineArgs.max_prompt_adapters,
-                            help='Max number of PromptAdapters in a batch.')
-        parser.add_argument('--max-prompt-adapter-token',
-                            type=int,
-                            default=EngineArgs.max_prompt_adapter_token,
-                            help='Max number of PromptAdapters tokens')
         parser.add_argument("--device",
                             type=str,
                             default=EngineArgs.device,
@@ -781,26 +696,6 @@ class EngineArgs:
             "will also be used in `model_name` tag content of "
             "prometheus metrics, if multiple names provided, metrics"
             "tag will take the first one.")
-        parser.add_argument('--qlora-adapter-name-or-path',
-                            type=str,
-                            default=None,
-                            help='Name or path of the QLoRA adapter.')
-
-        parser.add_argument(
-            '--otlp-traces-endpoint',
-            type=str,
-            default=None,
-            help='Target URL to which OpenTelemetry traces will be sent.')
-        parser.add_argument(
-            '--collect-detailed-traces',
-            type=str,
-            default=None,
-            help="Valid choices are " +
-            ",".join(ALLOWED_DETAILED_TRACE_MODULES) +
-            ". It makes sense to set this only if --otlp-traces-endpoint is"
-            " set. If set, it will collect detailed traces for the specified "
-            "modules. This involves use of possibly costly and or blocking "
-            "operations and hence might have a performance impact.")
 
         parser.add_argument(
             '--disable-async-output-proc',
@@ -808,12 +703,6 @@ class EngineArgs:
             default=EngineArgs.disable_async_output_proc,
             help="Disable async output processing. This may result in "
             "lower performance.")
-        parser.add_argument(
-            '--override-neuron-config',
-            type=json.loads,
-            default=None,
-            help="Override or set neuron device configuration. "
-            "e.g. {\"cast_logits_dtype\": \"bloat16\"}.'")
 
         parser.add_argument(
             '--scheduling-policy',
@@ -861,7 +750,6 @@ class EngineArgs:
             served_model_name=self.served_model_name,
             limit_mm_per_prompt=self.limit_mm_per_prompt,
             use_async_output_proc=not self.disable_async_output_proc,
-            override_neuron_config=self.override_neuron_config,
             config_format=self.config_format,
             mm_processor_kwargs=self.mm_processor_kwargs,
         )
@@ -881,18 +769,16 @@ class EngineArgs:
 
         # bitsandbytes quantization needs a specific model loader
         # so we make sure the quant method and the load format are consistent
-        if (self.quantization == "bitsandbytes" or
-           self.qlora_adapter_name_or_path is not None) and \
+        if self.quantization == "bitsandbytes" and \
            self.load_format != "bitsandbytes":
             raise ValueError(
-                "BitsAndBytes quantization and QLoRA adapter only support "
+                "BitsAndBytes quantization only support "
                 f"'bitsandbytes' load format, but got {self.load_format}")
 
-        if (self.load_format == "bitsandbytes" or
-            self.qlora_adapter_name_or_path is not None) and \
+        if self.load_format == "bitsandbytes" and \
             self.quantization != "bitsandbytes":
             raise ValueError(
-                "BitsAndBytes load format and QLoRA adapter only support "
+                "BitsAndBytes load format only support "
                 f"'bitsandbytes' quantization, but got {self.quantization}")
 
         assert self.cpu_offload_gb >= 0, (
@@ -910,9 +796,7 @@ class EngineArgs:
             self.enable_prefix_caching = False
 
         cache_config = CacheConfig(
-            # neuron needs block_size = max_model_len
-            block_size=self.block_size if self.device != "neuron" else
-            (self.max_model_len if self.max_model_len is not None else 0),
+            block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             swap_space=self.swap_space,
             cache_dtype=self.kv_cache_dtype,
@@ -925,7 +809,6 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
-            worker_use_ray=self.worker_use_ray,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
             tokenizer_pool_config=TokenizerPoolConfig.create_config(
@@ -950,9 +833,7 @@ class EngineArgs:
                 use_sliding_window = (model_config.get_sliding_window()
                                       is not None)
                 use_spec_decode = self.speculative_model is not None
-                if (is_gpu and not use_sliding_window and not use_spec_decode
-                        and not self.enable_lora
-                        and not self.enable_prompt_adapter):
+                if (is_gpu and not use_sliding_window and not use_spec_decode):
                     self.enable_chunked_prefill = True
                     logger.warning(
                         "Chunked prefill is enabled by default for models with "
@@ -1015,16 +896,6 @@ class EngineArgs:
             if speculative_config is None \
             else speculative_config.num_lookahead_slots
 
-        if not self.use_v2_block_manager:
-            logger.warning(
-                "[DEPRECATED] Block manager v1 has been removed, "
-                "and setting --use-v2-block-manager to True or False has "
-                "no effect on vLLM behavior. Please remove "
-                "--use-v2-block-manager in your engine argument. "
-                "If your use case is not supported by "
-                "SelfAttnBlockSpaceManager (i.e. block manager v2),"
-                " please file an issue with detailed information.")
-
         scheduler_config = SchedulerConfig(
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_seqs=self.max_num_seqs,
@@ -1037,33 +908,11 @@ class EngineArgs:
             preemption_mode=self.preemption_mode,
             num_scheduler_steps=self.num_scheduler_steps,
             multi_step_stream_outputs=self.multi_step_stream_outputs,
-            send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
-                             and parallel_config.use_ray),
+            send_delta_data=False,
             policy=self.scheduling_policy,
         )
-        lora_config = LoRAConfig(
-            max_lora_rank=self.max_lora_rank,
-            max_loras=self.max_loras,
-            fully_sharded_loras=self.fully_sharded_loras,
-            lora_extra_vocab_size=self.lora_extra_vocab_size,
-            long_lora_scaling_factors=self.long_lora_scaling_factors,
-            lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
-            and self.max_cpu_loras > 0 else None) if self.enable_lora else None
-
-        if self.qlora_adapter_name_or_path is not None and \
-            self.qlora_adapter_name_or_path != "":
-            if self.model_loader_extra_config is None:
-                self.model_loader_extra_config = {}
-            self.model_loader_extra_config[
-                "qlora_adapter_name_or_path"] = self.qlora_adapter_name_or_path
 
         load_config = self.create_load_config()
-
-        prompt_adapter_config = PromptAdapterConfig(
-            max_prompt_adapters=self.max_prompt_adapters,
-            max_prompt_adapter_token=self.max_prompt_adapter_token) \
-                                        if self.enable_prompt_adapter else None
 
         decoding_config = DecodingConfig(
             guided_decoding_backend=self.guided_decoding_backend)
@@ -1076,13 +925,6 @@ class EngineArgs:
                 raise ValueError(
                     f"Invalid module {m} in collect_detailed_traces. "
                     f"Valid modules are {ALLOWED_DETAILED_TRACE_MODULES}")
-        observability_config = ObservabilityConfig(
-            otlp_traces_endpoint=self.otlp_traces_endpoint,
-            collect_model_forward_time="model" in detailed_trace_modules
-            or "all" in detailed_trace_modules,
-            collect_model_execute_time="worker" in detailed_trace_modules
-            or "all" in detailed_trace_modules,
-        )
 
         return EngineConfig(
             model_config=model_config,
@@ -1090,12 +932,9 @@ class EngineArgs:
             parallel_config=parallel_config,
             scheduler_config=scheduler_config,
             device_config=device_config,
-            lora_config=lora_config,
             speculative_config=speculative_config,
             load_config=load_config,
             decoding_config=decoding_config,
-            observability_config=observability_config,
-            prompt_adapter_config=prompt_adapter_config,
         )
 
 

@@ -278,13 +278,7 @@ class StatefulModelInput(BroadcastableModelInput):
                                                                     num_seqs]
 
         # Assert unsupported
-        assert fmi.lora_mapping is None
-        assert fmi.lora_requests is not None
-        assert len(fmi.lora_requests) == 0
         assert fmi.attn_metadata is not None
-        assert fmi.prompt_adapter_mapping is None
-        assert fmi.prompt_adapter_requests is not None
-        assert len(fmi.prompt_adapter_requests) == 0
         assert fmi.multi_modal_kwargs is not None
         assert len(fmi.multi_modal_kwargs) == 0
 
@@ -459,7 +453,7 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
-        """ 
+        """
         Execute the model for a single step and update multi-step
         metadata
         """
@@ -660,9 +654,6 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
     def profile_run(self) -> None:
         return self._base_model_runner.profile_run()
 
-    def remove_all_loras(self):
-        return self._base_model_runner.remove_all_loras()
-
     def capture_model(self, kv_caches: List[List]) -> None:
         return self._base_model_runner.capture_model(kv_caches)
 
@@ -685,14 +676,14 @@ def deferred_pythonize_logprobs(
     1. Pythonize GPU-side sampler result tensors into CPU-side sampler result.
     2. Pythonize GPU-side logprobs tensor into CPU-side logprobs lists,
        utilizing  the Pythonized sampler result computed in step 1.
-    
+
     These deferred computations are not required for single-step scheduling
     or the `profile_run()` phase of multi-step scheduling.
 
     Args:
         output: sampler output (under deferred Pythonization)
         sampling_metadata
-        
+
     Returns:
         prompt_logprobs (CPU), sample_logprobs (CPU)
     """
@@ -725,10 +716,10 @@ def _pythonize_sampler_output(
     logprobs_tensor: Optional[torch.Tensor],
     cache: Optional[PythonizationCache],
 ) -> None:
-    """ This function is only called when the output tensors are ready. 
-    See :class:`ModelOutput`. 
-    
-    Modifies `output.outputs` and `pinned_sampled_token_buffer` in-place, 
+    """ This function is only called when the output tensors are ready.
+    See :class:`ModelOutput`.
+
+    Modifies `output.outputs` and `pinned_sampled_token_buffer` in-place,
     adding a Pythonized output data structure
     (:class:`CompletionSequenceGroupOutput`) for each :class:`SequenceGroup`.
 
@@ -739,7 +730,7 @@ def _pythonize_sampler_output(
                                          (receives copy of
                                          GPU-side token buffer.)
       sampled_token_ids: GPU-side token buffer
-      logprobs_tensor: GPU-side tensor containing 
+      logprobs_tensor: GPU-side tensor containing
                        logprobs computed during sampling
     """
 

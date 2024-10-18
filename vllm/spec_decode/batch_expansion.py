@@ -371,7 +371,6 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
             block_tables={
                 target_seq_id: seq_group_metadata.block_tables[seq_id],
             },
-            lora_request=None,
             token_chunk_size=1,
         )
 

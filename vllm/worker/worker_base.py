@@ -7,10 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 
-from vllm.config import ObservabilityConfig
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.platforms import current_platform
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
@@ -84,41 +82,6 @@ class WorkerBase(ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def remove_lora(self, lora_id: int) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def pin_lora(self, lora_id: int) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def list_loras(self) -> Set[int]:
-        raise NotImplementedError
-
-
-class LoraNotSupportedWorkerBase(WorkerBase):
-    """Partial implementation of WorkerBase that raises exceptions when LoRA
-    methods are invoked.
-    """
-
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        raise ValueError(f"{type(self)} does not support LoRA")
-
-    def remove_lora(self, lora_id: int) -> bool:
-        raise ValueError(f"{type(self)} does not support LoRA")
-
-    def pin_lora(self, lora_id: int) -> bool:
-        return ValueError(
-            f"{type(self)} does not support LoRA")  # type: ignore
-
-    def list_loras(self) -> Set[int]:
-        raise ValueError(f"{type(self)} does not support LoRA")
-
 
 @dataclasses.dataclass(frozen=True)
 class WorkerInput:
@@ -179,7 +142,6 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     """
     is_driver_worker: bool
     model_runner: ModelRunnerBase
-    observability_config: Optional[ObservabilityConfig] = None
 
     @property
     @abstractmethod
@@ -319,10 +281,6 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
-            if (self.observability_config is not None
-                    and self.observability_config.collect_model_execute_time):
-                orig_model_execute_time = intermediate_tensors.tensors.get(
-                    "model_execute_time", torch.tensor(0)).item()
 
         output = self.model_runner.execute_model(
             model_input=model_input,
@@ -336,19 +294,9 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:
             # output is IntermediateTensors
-            if (self.observability_config is not None
-                    and self.observability_config.collect_model_execute_time):
-                output.tensors["model_execute_time"] = torch.tensor(
-                    model_execute_time + orig_model_execute_time)
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
             return [None]
-        if (self.observability_config is not None
-                and self.observability_config.collect_model_execute_time
-                and output is not None):
-            for o in output:
-                o.model_execute_time = (orig_model_execute_time +
-                                        model_execute_time)
 
         # output is List[SamplerOutput]
         return output
@@ -469,7 +417,7 @@ def extract_previous_hidden_states(
         data: Union[ExecuteModelRequest, Dict[str, torch.Tensor]]) -> \
             Dict[str, torch.Tensor]:
     """If data contains previous_hidden_states, extract it. This returns a dict
-    which can be used directly as additional kwargs in any following 
+    which can be used directly as additional kwargs in any following
     execute_model calls. This is used in draft models like EAGLE."""
     output = {}
 

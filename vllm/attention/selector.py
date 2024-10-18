@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import STR_BACKEND_ENV_VAR, is_cpu, is_hip, is_openvino, is_xpu
+from vllm.utils import STR_BACKEND_ENV_VAR, is_hip
 
 logger = init_logger(__name__)
 
@@ -184,26 +184,6 @@ def which_attn_to_use(
         backend_by_env_var: Optional[str] = envs.VLLM_ATTENTION_BACKEND
         if backend_by_env_var is not None:
             selected_backend = backend_name_to_enum(backend_by_env_var)
-
-    if is_cpu():
-        if selected_backend != _Backend.TORCH_SDPA:
-            logger.info("Cannot use %s backend on CPU.", selected_backend)
-        return _Backend.TORCH_SDPA
-
-    if is_openvino():
-        if selected_backend != _Backend.OPENVINO:
-            logger.info("Cannot use %s backend on OpenVINO.", selected_backend)
-        return _Backend.OPENVINO
-
-    if is_xpu():
-        if selected_backend != _Backend.IPEX:
-            logger.info("Cannot use %s backend on XPU.", selected_backend)
-        return _Backend.IPEX
-
-    if current_platform.is_tpu():
-        if selected_backend != _Backend.PALLAS:
-            logger.info("Cannot use %s backend on TPU.", selected_backend)
-        return _Backend.PALLAS
 
     if is_hip():
         # AMD GPUs.

@@ -31,10 +31,8 @@ from vllm.engine.protocol import EngineClient
 from vllm.envs import VLLM_RPC_TIMEOUT
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.utils import deprecate_kwargs
@@ -90,7 +88,6 @@ class MQLLMEngineClient(EngineClient):
             model_config=self.model_config,
             scheduler_config=engine_config.scheduler_config,
             parallel_config=engine_config.parallel_config,
-            enable_lora=bool(engine_config.lora_config),
         )
 
         # Send RPCGenerateRequest to the MQLLMEngine.
@@ -316,8 +313,7 @@ class MQLLMEngineClient(EngineClient):
               or response != VLLM_RPC_SUCCESS_STR):
             raise ValueError(error_message)
 
-    async def get_tokenizer(self, lora_request: Optional[LoRARequest] = None):
-        return await self.tokenizer.get_lora_tokenizer_async(lora_request)
+    async def get_tokenizer(self): return self.tokenizer.tokenizer
 
     async def get_decoding_config(self) -> DecodingConfig:
         return self.decoding_config
@@ -386,9 +382,7 @@ class MQLLMEngineClient(EngineClient):
         inputs: PromptType,
         sampling_params: SamplingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         ...
@@ -399,9 +393,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: PromptType,
         sampling_params: SamplingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         ...
@@ -415,9 +407,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: Optional[PromptType] = None,
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
         *,
         inputs: Optional[PromptType] = None  # DEPRECATED
@@ -433,12 +423,9 @@ class MQLLMEngineClient(EngineClient):
                 for more details about the format of each input.
             sampling_params: The sampling parameters of the request.
             request_id: The unique id of the request.
-            lora_request: LoRA request to use for generation, if any.
             trace_headers: OpenTelemetry trace headers.
-            prompt_adapter_request: Prompt Adapter request to use
-                                            for generation, if any.
-            priority: Priority of the request (lower means earlier handling). 
-                Any priority other than 0 will lead to an error if the 
+            priority: Priority of the request (lower means earlier handling).
+                Any priority other than 0 will lead to an error if the
                 scheduling policy is not "priority".
         """
         if inputs is not None:
@@ -446,9 +433,7 @@ class MQLLMEngineClient(EngineClient):
         assert (prompt is not None and sampling_params is not None
                 and request_id is not None)
 
-        return self._process_request(prompt, sampling_params, request_id,
-                                     lora_request, trace_headers,
-                                     prompt_adapter_request, priority)
+        return self._process_request(prompt, sampling_params, request_id, trace_headers, priority)
 
     @overload  # DEPRECATED
     def encode(
@@ -457,7 +442,6 @@ class MQLLMEngineClient(EngineClient):
         inputs: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> AsyncGenerator[EmbeddingRequestOutput, None]:
@@ -469,7 +453,6 @@ class MQLLMEngineClient(EngineClient):
         prompt: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> AsyncGenerator[EmbeddingRequestOutput, None]:
@@ -484,7 +467,6 @@ class MQLLMEngineClient(EngineClient):
         prompt: Optional[PromptType] = None,
         pooling_params: Optional[PoolingParams] = None,
         request_id: Optional[str] = None,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         *,
@@ -501,7 +483,6 @@ class MQLLMEngineClient(EngineClient):
                 for more details about the format of each input.
             pooling_params: The pooling parameters of the request.
             request_id: The unique id of the request.
-            lora_request: LoRA request to use for generation, if any.
             trace_headers: OpenTelemetry trace headers.
 
         Yields:
@@ -518,7 +499,6 @@ class MQLLMEngineClient(EngineClient):
             self._process_request(prompt,
                                   pooling_params,
                                   request_id,
-                                  lora_request,
                                   trace_headers,
                                   priority=priority))
 
@@ -527,9 +507,7 @@ class MQLLMEngineClient(EngineClient):
         prompt: PromptType,
         params: Union[SamplingParams, PoolingParams],
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> Union[AsyncGenerator[RequestOutput, None], AsyncGenerator[
             EmbeddingRequestOutput, None]]:
@@ -547,7 +525,7 @@ class MQLLMEngineClient(EngineClient):
             params = await \
                 build_guided_decoding_logits_processor_async(
                     sampling_params=params,
-                    tokenizer=await self.get_tokenizer(lora_request),
+                    tokenizer=await self.get_tokenizer(),
                     default_guided_backend=(self.decoding_config.guided_decoding_backend
                         if self.decoding_config
                         else DecodingConfig.guided_decoding_backend),
@@ -575,9 +553,7 @@ class MQLLMEngineClient(EngineClient):
                     prompt=prompt,
                     params=params,
                     request_id=request_id,
-                    lora_request=lora_request,
                     trace_headers=trace_headers,
-                    prompt_adapter_request=prompt_adapter_request,
                     priority=priority,
                 ))
 

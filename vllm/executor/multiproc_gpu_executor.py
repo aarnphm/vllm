@@ -25,8 +25,6 @@ logger = init_logger(__name__)
 class MultiprocessingGPUExecutor(DistributedGPUExecutor):
     """Python multiprocessing-based multi-GPU executor"""
 
-    uses_ray: bool = False
-
     def _init_executor(self) -> None:
         self._check_executor_parameters()
 

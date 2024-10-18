@@ -62,7 +62,6 @@ if TYPE_CHECKING:
     VLLM_PLUGINS: Optional[List[str]] = None
     VLLM_TORCH_PROFILER_DIR: Optional[str] = None
     VLLM_USE_TRITON_AWQ: bool = False
-    VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_TORCH_COMPILE_LEVEL: int = 0
     VLLM_CUSTOM_OPS: List[str] = []
@@ -424,11 +423,6 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_USE_TRITON_AWQ":
     lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
 
-    # If set, allow loading or unloading lora adapters in runtime,
-    "VLLM_ALLOW_RUNTIME_LORA_UPDATING":
-    lambda:
-    (os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower() in
-     ("1", "true")),
 
     # By default, vLLM will check the peer-to-peer capability itself,
     # in case of broken drivers. See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa

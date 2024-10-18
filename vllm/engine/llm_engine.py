@@ -13,9 +13,8 @@ from typing_extensions import TypeVar
 
 import vllm.envs as envs
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
-                         EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
-                         ObservabilityConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
+                         EngineConfig, LoadConfig, ModelConfig,
+                         ParallelConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
                                  SchedulerOutputs)
@@ -28,19 +27,16 @@ from vllm.engine.output_processor.util import create_output_by_sequence_group
 from vllm.entrypoints.openai.logits_processors import get_logits_processors
 from vllm.executor.executor_base import ExecutorBase
 from vllm.executor.gpu_executor import GPUExecutor
-from vllm.executor.ray_utils import initialize_ray_cluster
 from vllm.inputs import (INPUT_REGISTRY, DecoderOnlyInputs,
                          EncoderDecoderInputs, InputRegistry, PromptType)
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.guided_decoding import (
     get_local_guided_decoding_logits_processor)
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.outputs import (EmbeddingRequestOutput, RequestOutput,
                           RequestOutputFactory)
 from vllm.pooling_params import PoolingParams
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
                            Sequence, SequenceGroup, SequenceGroupMetadata,
@@ -152,13 +148,10 @@ class LLMEngine:
         parallel_config: The configuration related to distributed execution.
         scheduler_config: The configuration related to the request scheduler.
         device_config: The configuration related to the device.
-        lora_config (Optional): The configuration related to serving multi-LoRA.
         speculative_config (Optional): The configuration related to speculative
             decoding.
         executor_class: The model executor class for managing distributed
             execution.
-        prompt_adapter_config (Optional): The configuration related to serving
-            prompt adapters.
         log_stats: Whether to log statistics.
         usage_context: Specified entry point, used for usage info collection.
     """
@@ -222,11 +215,8 @@ class LLMEngine:
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         load_config: LoadConfig,
-        lora_config: Optional[LoRAConfig],
         speculative_config: Optional[SpeculativeConfig],
         decoding_config: Optional[DecodingConfig],
-        observability_config: Optional[ObservabilityConfig],
-        prompt_adapter_config: Optional[PromptAdapterConfig],
         executor_class: Type[ExecutorBase],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -238,7 +228,6 @@ class LLMEngine:
             "Initializing an LLM engine (v%s) with config: "
             "model=%r, speculative_config=%r, tokenizer=%r, "
             "skip_tokenizer_init=%s, tokenizer_mode=%s, revision=%s, "
-            "override_neuron_config=%s, "
             "rope_scaling=%r, rope_theta=%r, tokenizer_revision=%s, "
             "trust_remote_code=%s, dtype=%s, max_seq_len=%d, "
             "download_dir=%r, load_format=%s, tensor_parallel_size=%d, "
@@ -246,7 +235,7 @@ class LLMEngine:
             "disable_custom_all_reduce=%s, quantization=%s, "
             "enforce_eager=%s, kv_cache_dtype=%s, "
             "quantization_param_path=%s, device_config=%s, "
-            "decoding_config=%r, observability_config=%r, "
+            "decoding_config=%r, "
             "seed=%d, served_model_name=%s, "
             "num_scheduler_steps=%d, chunked_prefill_enabled=%s "
             "multi_step_stream_outputs=%s, enable_prefix_caching=%s, "
@@ -259,7 +248,6 @@ class LLMEngine:
             model_config.skip_tokenizer_init,
             model_config.tokenizer_mode,
             model_config.revision,
-            model_config.override_neuron_config,
             model_config.rope_scaling,
             model_config.rope_theta,
             model_config.tokenizer_revision,
@@ -277,7 +265,6 @@ class LLMEngine:
             model_config.quantization_param_path,
             device_config.device,
             decoding_config,
-            observability_config,
             model_config.seed,
             model_config.served_model_name,
             scheduler_config.num_scheduler_steps,
@@ -291,16 +278,12 @@ class LLMEngine:
         # TODO(woosuk): Print more configs in debug mode.
         self.model_config = model_config
         self.cache_config = cache_config
-        self.lora_config = lora_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.device_config = device_config
         self.speculative_config = speculative_config
         self.load_config = load_config
         self.decoding_config = decoding_config or DecodingConfig()
-        self.prompt_adapter_config = prompt_adapter_config
-        self.observability_config = observability_config or ObservabilityConfig(
-        )
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
@@ -318,7 +301,7 @@ class LLMEngine:
         def get_tokenizer_for_seq(sequence: Sequence) -> AnyTokenizer:
             assert tokenizer_group, ("tokenizer_group cannot be None, "
                                      "make sure skip_tokenizer_init is False")
-            return tokenizer_group.get_lora_tokenizer(sequence.lora_request)
+            return tokenizer_group.tokenizer
 
         self.seq_counter = Counter()
         self.generation_config_fields = _load_generation_config_dict(
@@ -337,11 +320,8 @@ class LLMEngine:
             parallel_config=parallel_config,
             scheduler_config=scheduler_config,
             device_config=device_config,
-            lora_config=lora_config,
             speculative_config=speculative_config,
             load_config=load_config,
-            prompt_adapter_config=prompt_adapter_config,
-            observability_config=self.observability_config,
         )
 
         if not self.model_config.embedding_mode:
@@ -372,10 +352,6 @@ class LLMEngine:
                     str(cache_config.cache_dtype),
 
                     # Feature flags
-                    "enable_lora":
-                    bool(lora_config),
-                    "enable_prompt_adapter":
-                    bool(prompt_adapter_config),
                     "enable_prefix_caching":
                     cache_config.enable_prefix_caching,
                     "enforce_eager":
@@ -420,7 +396,7 @@ class LLMEngine:
         # GPU and CPU blocks, which are profiled in the distributed executor.
         self.scheduler = [
             Scheduler(
-                scheduler_config, cache_config, lora_config,
+                scheduler_config, cache_config,
                 parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id]
                 if model_config.use_async_output_proc else None)
@@ -453,10 +429,6 @@ class LLMEngine:
                                                      self.cache_config)
 
         self.tracer = None
-        if self.observability_config.otlp_traces_endpoint:
-            self.tracer = init_tracer(
-                "vllm.llm_engine",
-                self.observability_config.otlp_traces_endpoint)
 
         # Create sequence output processor, e.g. for beam search or
         # speculative decoding.
@@ -506,46 +478,7 @@ class LLMEngine:
                 raise TypeError(
                     "distributed_executor_backend must be a subclass of "
                     f"ExecutorBase. Got {distributed_executor_backend}.")
-            if distributed_executor_backend.uses_ray:  # type: ignore
-                initialize_ray_cluster(engine_config.parallel_config)
             executor_class = distributed_executor_backend
-        elif engine_config.device_config.device_type == "neuron":
-            from vllm.executor.neuron_executor import NeuronExecutor
-            executor_class = NeuronExecutor
-        elif engine_config.device_config.device_type == "tpu":
-            if distributed_executor_backend == "ray":
-                initialize_ray_cluster(engine_config.parallel_config)
-                from vllm.executor.ray_tpu_executor import RayTPUExecutor
-                executor_class = RayTPUExecutor
-            else:
-                assert distributed_executor_backend is None
-                from vllm.executor.tpu_executor import TPUExecutor
-                executor_class = TPUExecutor
-        elif engine_config.device_config.device_type == "cpu":
-            from vllm.executor.cpu_executor import CPUExecutor
-            executor_class = CPUExecutor
-        elif engine_config.device_config.device_type == "openvino":
-            from vllm.executor.openvino_executor import OpenVINOExecutor
-            executor_class = OpenVINOExecutor
-        elif engine_config.device_config.device_type == "xpu":
-            if distributed_executor_backend == "ray":
-                initialize_ray_cluster(engine_config.parallel_config)
-                from vllm.executor.ray_xpu_executor import RayXPUExecutor
-                executor_class = RayXPUExecutor
-            elif distributed_executor_backend == "mp":
-                # FIXME(kunshang):
-                # spawn needs calling `if __name__ == '__main__':``
-                # fork is not supported for xpu start new process.
-                logger.error(
-                    "Both start methods (spawn and fork) have issue "
-                    "on XPU if you use mp backend, Please try ray instead.")
-            else:
-                from vllm.executor.xpu_executor import XPUExecutor
-                executor_class = XPUExecutor
-        elif distributed_executor_backend == "ray":
-            initialize_ray_cluster(engine_config.parallel_config)
-            from vllm.executor.ray_gpu_executor import RayGPUExecutor
-            executor_class = RayGPUExecutor
         elif distributed_executor_backend == "mp":
             from vllm.executor.multiproc_gpu_executor import (
                 MultiprocessingGPUExecutor)
@@ -607,29 +540,17 @@ class LLMEngine:
 
         return tokenizer_group
 
-    def get_tokenizer(
-        self,
-        lora_request: Optional[LoRARequest] = None,
-    ) -> AnyTokenizer:
-        return self.get_tokenizer_group().get_lora_tokenizer(lora_request)
+    def get_tokenizer(self) -> AnyTokenizer: return self.get_tokenizer_group().tokenizer
 
     def _init_tokenizer(self) -> BaseTokenizerGroup:
         return init_tokenizer_from_configs(
             model_config=self.model_config,
             scheduler_config=self.scheduler_config,
-            parallel_config=self.parallel_config,
-            enable_lora=bool(self.lora_config))
+            parallel_config=self.parallel_config)
 
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
-        if self.lora_config:
-            self.lora_config.verify_with_model_config(self.model_config)
-            self.lora_config.verify_with_scheduler_config(
-                self.scheduler_config)
-        if self.prompt_adapter_config:
-            self.prompt_adapter_config.verify_with_model_config(
-                self.model_config)
 
     def _add_processed_request(
         self,
@@ -637,8 +558,6 @@ class LLMEngine:
         processed_inputs: Union[DecoderOnlyInputs, EncoderDecoderInputs],
         params: Union[SamplingParams, PoolingParams],
         arrival_time: float,
-        lora_request: Optional[LoRARequest],
-        prompt_adapter_request: Optional[PromptAdapterRequest],
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> None:
@@ -646,10 +565,9 @@ class LLMEngine:
         # Create the sequences.
         block_size = self.cache_config.block_size
         seq_id = next(self.seq_counter)
-        eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
+        eos_token_id = self.input_preprocessor.get_eos_token_id()
 
-        seq = Sequence(seq_id, processed_inputs, block_size, eos_token_id,
-                       lora_request, prompt_adapter_request)
+        seq = Sequence(seq_id, processed_inputs, block_size, eos_token_id)
 
         encoder_seq = None
         if 'encoder_prompt_token_ids' in processed_inputs:
@@ -657,8 +575,6 @@ class LLMEngine:
                                    processed_inputs,
                                    block_size,
                                    eos_token_id,
-                                   lora_request,
-                                   prompt_adapter_request,
                                    from_decoder_prompt=False)
 
         # Create a SequenceGroup based on SamplingParams or PoolingParams
@@ -668,9 +584,7 @@ class LLMEngine:
                 seq,
                 params,
                 arrival_time=arrival_time,
-                lora_request=lora_request,
                 trace_headers=trace_headers,
-                prompt_adapter_request=prompt_adapter_request,
                 encoder_seq=encoder_seq,
                 priority=priority)
         elif isinstance(params, PoolingParams):
@@ -679,8 +593,6 @@ class LLMEngine:
                 seq,
                 params,
                 arrival_time=arrival_time,
-                lora_request=lora_request,
-                prompt_adapter_request=prompt_adapter_request,
                 encoder_seq=encoder_seq,
                 priority=priority)
         else:
@@ -706,9 +618,7 @@ class LLMEngine:
         inputs: PromptType,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> None:
         ...
@@ -720,9 +630,7 @@ class LLMEngine:
         prompt: PromptType,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> None:
         ...
@@ -737,9 +645,7 @@ class LLMEngine:
             prompt: Optional[PromptType] = None,
             params: Optional[Union[SamplingParams, PoolingParams]] = None,
             arrival_time: Optional[float] = None,
-            lora_request: Optional[LoRARequest] = None,
             trace_headers: Optional[Mapping[str, str]] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
@@ -791,10 +697,6 @@ class LLMEngine:
             prompt = inputs
         assert prompt is not None and params is not None
 
-        if lora_request is not None and not self.lora_config:
-            raise ValueError(f"Got lora_request {lora_request} but LoRA is "
-                             "not enabled!")
-
         if priority != 0 and not self.scheduler_config.policy == "priority":
             raise ValueError(f"Got priority {priority} but "
                              "Priority scheduling is not enabled.")
@@ -805,8 +707,6 @@ class LLMEngine:
         preprocessed_inputs = self.input_preprocessor.preprocess(
             prompt,
             request_id=request_id,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
 
@@ -822,8 +722,6 @@ class LLMEngine:
             processed_inputs=processed_inputs,
             params=params,
             arrival_time=arrival_time,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
             priority=priority,
         )
@@ -834,9 +732,7 @@ class LLMEngine:
         seq: Sequence,
         sampling_params: SamplingParams,
         arrival_time: float,
-        lora_request: Optional[LoRARequest],
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
     ) -> SequenceGroup:
@@ -850,7 +746,7 @@ class LLMEngine:
                              f"{max_logprobs} logprobs.")
 
         sampling_params = self._build_logits_processors(
-            sampling_params, lora_request)
+            sampling_params)
 
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
@@ -865,9 +761,7 @@ class LLMEngine:
             seqs=[seq],
             arrival_time=arrival_time,
             sampling_params=sampling_params,
-            lora_request=lora_request,
             trace_headers=trace_headers,
-            prompt_adapter_request=prompt_adapter_request,
             encoder_seq=encoder_seq,
             priority=priority)
 
@@ -879,8 +773,6 @@ class LLMEngine:
         seq: Sequence,
         pooling_params: PoolingParams,
         arrival_time: float,
-        lora_request: Optional[LoRARequest],
-        prompt_adapter_request: Optional[PromptAdapterRequest],
         encoder_seq: Optional[Sequence] = None,
         priority: int = 0,
     ) -> SequenceGroup:
@@ -892,9 +784,7 @@ class LLMEngine:
             request_id=request_id,
             seqs=[seq],
             arrival_time=arrival_time,
-            lora_request=lora_request,
             pooling_params=pooling_params,
-            prompt_adapter_request=prompt_adapter_request,
             encoder_seq=encoder_seq,
             priority=priority)
         return seq_group
@@ -935,10 +825,6 @@ class LLMEngine:
         """Gets the scheduler configuration."""
         return self.scheduler_config
 
-    def get_lora_config(self) -> LoRAConfig:
-        """Gets the LoRA configuration."""
-        return self.lora_config
-
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
         return sum(scheduler.get_num_unfinished_seq_groups()
@@ -976,9 +862,9 @@ class LLMEngine:
         This function updates num_computed_tokens for prompt sequences
         when Multi-Step is enabled.
 
-        seq_group: SequenceGroup to update the num_computed_tokens for. 
+        seq_group: SequenceGroup to update the num_computed_tokens for.
         seq_group_meta: Metadata of the given SequenceGroup.
-        is_first_step_output: Optional[bool] - 
+        is_first_step_output: Optional[bool] -
             When available, is_first_step_output indicates if the appended
             output token is the output of the first-step in multi-step.
             A value of None indicates that outputs from all steps in
@@ -1740,28 +1626,6 @@ class LLMEngine:
             finished_reason_requests=finished_reason_requests,
         )
 
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        return self.model_executor.add_lora(lora_request)
-
-    def remove_lora(self, lora_id: int) -> bool:
-        return self.model_executor.remove_lora(lora_id)
-
-    def list_loras(self) -> Set[int]:
-        return self.model_executor.list_loras()
-
-    def pin_lora(self, lora_id: int) -> bool:
-        return self.model_executor.pin_lora(lora_id)
-
-    def add_prompt_adapter(
-            self, prompt_adapter_request: PromptAdapterRequest) -> bool:
-        return self.model_executor.add_prompt_adapter(prompt_adapter_request)
-
-    def remove_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        return self.model_executor.remove_prompt_adapter(prompt_adapter_id)
-
-    def list_prompt_adapters(self) -> List[int]:
-        return self.model_executor.list_prompt_adapters()
-
     def check_health(self) -> None:
         if self.tokenizer:
             self.tokenizer.check_health()
@@ -1889,8 +1753,7 @@ class LLMEngine:
             # max_batch_len = self.scheduler_config.max_num_batched_tokens
 
     def _build_logits_processors(
-            self, sampling_params: SamplingParams,
-            lora_request: Optional[LoRARequest]) -> SamplingParams:
+            self, sampling_params: SamplingParams) -> SamplingParams:
         """Constructs logits processors based on the guided_decoding,
         logits_bias, and allowed_token_ids fields in sampling_params. Deletes
         those fields and adds the constructed logits processors to the
@@ -1903,7 +1766,7 @@ class LLMEngine:
                 "Building guided decoding logits processor in "
                 "LLMEngine. Params: %s", guided_decoding)
 
-            tokenizer = self.get_tokenizer(lora_request=lora_request)
+            tokenizer = self.get_tokenizer()
             guided_decoding.backend = guided_decoding.backend or \
                 self.decoding_config.guided_decoding_backend
 
@@ -1916,7 +1779,7 @@ class LLMEngine:
             sampling_params.guided_decoding = None
 
         if (sampling_params.logit_bias or sampling_params.allowed_token_ids):
-            tokenizer = self.get_tokenizer(lora_request=lora_request)
+            tokenizer = self.get_tokenizer()
 
             processors = get_logits_processors(
                 logit_bias=sampling_params.logit_bias,

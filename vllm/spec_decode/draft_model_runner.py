@@ -17,8 +17,8 @@ except (ModuleNotFoundError, ImportError) as err:
         "Draft model speculative decoding currently only supports"
         "CUDA and ROCm flash attention backend.") from err
 
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
-                         ModelConfig, ObservabilityConfig, ParallelConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
+                         ModelConfig, ParallelConfig,
                          PromptAdapterConfig, SchedulerConfig)
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalInputs
@@ -57,12 +57,9 @@ class TP1DraftModelRunner(ModelRunner):
         device_config: DeviceConfig,
         cache_config: CacheConfig,
         load_config: LoadConfig,
-        lora_config: Optional[LoRAConfig],
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
-        prompt_adapter_config: Optional[PromptAdapterConfig] = None,
         return_hidden_states: bool = False,
-        observability_config: Optional[ObservabilityConfig] = None,
     ):
         if return_hidden_states:
             raise ValueError(
@@ -76,12 +73,9 @@ class TP1DraftModelRunner(ModelRunner):
             device_config=device_config,
             cache_config=cache_config,
             load_config=load_config,
-            lora_config=lora_config,
             kv_cache_dtype=kv_cache_dtype,
             is_driver_worker=is_driver_worker,
-            prompt_adapter_config=prompt_adapter_config,
             return_hidden_states=return_hidden_states,
-            observability_config=observability_config,
         )
 
     def _update_sampling_metadata(self, sampling_metadata, num_seqs,
@@ -135,8 +129,6 @@ class TP1DraftModelRunner(ModelRunner):
             attn_metadata=attn_metadata,
             seq_lens=attn_metadata.seq_lens,
             query_lens=model_input.query_lens,
-            lora_mapping=model_input.lora_mapping,
-            lora_requests=model_input.lora_requests,
             multi_modal_kwargs=model_input.multi_modal_kwargs,
             sampling_metadata=model_input.sampling_metadata,
             is_prompt=False,
@@ -165,10 +157,8 @@ class TP1DraftModelRunner(ModelRunner):
     def supports_gpu_multi_step(self, execute_model_req: ExecuteModelRequest):
         """Determines if draft_model_runner GPU multi-step can be used.
         Currently required conditions are:
-            1. Only decodes 
+            1. Only decodes
             2. Only flash-attn
-            3. No LORA
-            4. No prompt_adapter_config
         """
         if not allow_gpu_advance_step:
             return False
@@ -182,13 +172,6 @@ class TP1DraftModelRunner(ModelRunner):
         if self.attn_backend.get_name() != "flash-attn":
             return False
 
-        # TODO: Add support for LORA
-        if self.lora_config:
-            return False
-
-        # TODO: Add soft-tuning prompt adapter support
-        return not self.prompt_adapter_config
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -198,12 +181,12 @@ class TP1DraftModelRunner(ModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
     ) -> Optional[List[SamplerOutput]]:
-        """Executes num_steps forward passes with advacement of input tensors 
+        """Executes num_steps forward passes with advacement of input tensors
         on the GPU. Look at supports_gpu_multi_step(..) for pre-conditions.
 
         Optimizations used:
             1. Input tensors are updated on the GPU directly
-            2. Skips GPU=>CPU serialization of sampler outputs (we don't need 
+            2. Skips GPU=>CPU serialization of sampler outputs (we don't need
                 them since we do batch expansion later that uses GPU outputs)
             3. Reuses sampling tensors (since we run only decodes and they have
                 a repeating sampling logic)
@@ -223,29 +206,11 @@ class TP1DraftModelRunner(ModelRunner):
                 raise ValueError("TP1DraftModelRunner only supports TP=1.")
 
             # Sanity
-            if self.lora_config is not None:
-                raise ValueError("TP1DraftModelRunner has no support for LORA")
-            if self.prompt_adapter_config is not None:
-                raise ValueError("TP1DraftModelRunner has no support for "
-                                 "prompt_adapter_config")
             if model_input.multi_modal_kwargs:
                 raise ValueError(
                     "TP1DraftModelRunner has no support for multi_modal_kwargs"
                 )
         else:
-            if self.lora_config:
-                assert model_input.lora_requests is not None
-                assert model_input.lora_mapping is not None
-                self.set_active_loras(model_input.lora_requests,
-                                      model_input.lora_mapping)
-
-            if self.prompt_adapter_config:
-                assert model_input.prompt_adapter_requests is not None
-                assert model_input.prompt_adapter_mapping is not None
-                self.set_active_prompt_adapters(
-                    model_input.prompt_adapter_requests,
-                    model_input.prompt_adapter_mapping)
-
             self.attn_state.begin_forward(model_input)
 
         # Detect exec mode

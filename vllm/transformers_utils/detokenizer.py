@@ -15,7 +15,7 @@ class Detokenizer:
 
     def get_tokenizer_for_seq(self, sequence: Sequence) -> AnyTokenizer:
         """Returns the HF tokenizer to use for a given sequence."""
-        return self.tokenizer_group.get_lora_tokenizer(sequence.lora_request)
+        return self.tokenizer_group.tokenizer
 
     def decode_prompt_logprobs_inplace(self, seq_group: SequenceGroup,
                                        prompt_logprobs: List[Optional[Dict[
@@ -26,9 +26,9 @@ class Detokenizer:
         Args:
             seq_group: The sequence group to decode.
             prompt_logprobs: The logprobs to decode.
-            position_offset: Offset of the first index of the logprobs 
+            position_offset: Offset of the first index of the logprobs
                 relative to the start of the sequence (for chunked prefill).
-        
+
         Returns:
             The prompt logprobs with the decoded tokens.
         """

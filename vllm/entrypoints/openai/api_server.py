@@ -43,10 +43,8 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               DetokenizeResponse,
                                               EmbeddingRequest,
                                               EmbeddingResponse, ErrorResponse,
-                                              LoadLoraAdapterRequest,
                                               TokenizeRequest,
-                                              TokenizeResponse,
-                                              UnloadLoraAdapterRequest)
+                                              TokenizeResponse)
 # yapf: enable
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
@@ -127,19 +125,13 @@ async def build_async_engine_client_from_engine_args(
     if (MQLLMEngineClient.is_unsupported_config(engine_args)
             or disable_frontend_multiprocessing):
         engine_config = engine_args.create_engine_config()
-        uses_ray = getattr(AsyncLLMEngine._get_executor_cls(engine_config),
-                           "uses_ray", False)
 
         build_engine = partial(AsyncLLMEngine.from_engine_args,
                                engine_args=engine_args,
                                engine_config=engine_config,
                                usage_context=UsageContext.OPENAI_API_SERVER)
-        if uses_ray:
-            # Must run in main thread with ray for its signal handlers to work
-            engine_client = build_engine()
-        else:
-            engine_client = await asyncio.get_running_loop().run_in_executor(
-                None, build_engine)
+        engine_client = await asyncio.get_running_loop().run_in_executor(
+            None, build_engine)
 
         yield engine_client
         return
@@ -371,42 +363,6 @@ if envs.VLLM_TORCH_PROFILER_DIR:
         return Response(status_code=200)
 
 
-if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
-    logger.warning(
-        "Lora dynamic loading & unloading is enabled in the API server. "
-        "This should ONLY be used for local development!")
-
-    @router.post("/v1/load_lora_adapter")
-    async def load_lora_adapter(request: LoadLoraAdapterRequest,
-                                raw_request: Request):
-        response = await chat(raw_request).load_lora_adapter(request)
-        if isinstance(response, ErrorResponse):
-            return JSONResponse(content=response.model_dump(),
-                                status_code=response.code)
-
-        response = await completion(raw_request).load_lora_adapter(request)
-        if isinstance(response, ErrorResponse):
-            return JSONResponse(content=response.model_dump(),
-                                status_code=response.code)
-
-        return Response(status_code=200, content=response)
-
-    @router.post("/v1/unload_lora_adapter")
-    async def unload_lora_adapter(request: UnloadLoraAdapterRequest,
-                                  raw_request: Request):
-        response = await chat(raw_request).unload_lora_adapter(request)
-        if isinstance(response, ErrorResponse):
-            return JSONResponse(content=response.model_dump(),
-                                status_code=response.code)
-
-        response = await completion(raw_request).unload_lora_adapter(request)
-        if isinstance(response, ErrorResponse):
-            return JSONResponse(content=response.model_dump(),
-                                status_code=response.code)
-
-        return Response(status_code=200, content=response)
-
-
 def build_app(args: Namespace) -> FastAPI:
     if args.disable_fastapi_docs:
         app = FastAPI(openapi_url=None,
@@ -492,36 +448,11 @@ def init_app_state(
         model_config,
         base_model_paths,
         args.response_role,
-        lora_modules=args.lora_modules,
-        prompt_adapters=args.prompt_adapters,
         request_logger=request_logger,
         chat_template=args.chat_template,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
         tool_parser=args.tool_call_parser)
-    state.openai_serving_completion = OpenAIServingCompletion(
-        engine_client,
-        model_config,
-        base_model_paths,
-        lora_modules=args.lora_modules,
-        prompt_adapters=args.prompt_adapters,
-        request_logger=request_logger,
-        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-    )
-    state.openai_serving_embedding = OpenAIServingEmbedding(
-        engine_client,
-        model_config,
-        base_model_paths,
-        request_logger=request_logger,
-    )
-    state.openai_serving_tokenization = OpenAIServingTokenization(
-        engine_client,
-        model_config,
-        base_model_paths,
-        lora_modules=args.lora_modules,
-        request_logger=request_logger,
-        chat_template=args.chat_template,
-    )
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:

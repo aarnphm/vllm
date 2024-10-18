@@ -336,15 +336,6 @@ def is_openvino() -> bool:
 
 
 @lru_cache(maxsize=None)
-def is_neuron() -> bool:
-    try:
-        import transformers_neuronx
-    except ImportError:
-        transformers_neuronx = None
-    return transformers_neuronx is not None
-
-
-@lru_cache(maxsize=None)
 def is_xpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
     try:
@@ -772,14 +763,6 @@ def is_pin_memory_available() -> bool:
         # https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications
         print_warning_once("Using 'pin_memory=False' as WSL is detected. "
                            "This may slow down the performance.")
-        return False
-    elif is_xpu():
-        print_warning_once("Pin memory is not supported on XPU.")
-        return False
-    elif is_neuron():
-        print_warning_once("Pin memory is not supported on Neuron.")
-        return False
-    elif is_cpu() or is_openvino():
         return False
     return True
 

@@ -25,7 +25,6 @@ from vllm.entrypoints.openai.protocol import (
     DeltaToolCall, ErrorResponse, FunctionCall, RequestResponseMetadata,
     ToolCall, UsageInfo)
 from vllm.entrypoints.openai.serving_engine import (BaseModelPath,
-                                                    LoRAModulePath,
                                                     OpenAIServing,
                                                     PromptAdapterPath,
                                                     TextTokensPrompt)
@@ -51,8 +50,6 @@ class OpenAIServingChat(OpenAIServing):
                  base_model_paths: List[BaseModelPath],
                  response_role: str,
                  *,
-                 lora_modules: Optional[List[LoRAModulePath]],
-                 prompt_adapters: Optional[List[PromptAdapterPath]],
                  request_logger: Optional[RequestLogger],
                  chat_template: Optional[str],
                  return_tokens_as_token_ids: bool = False,
@@ -61,8 +58,6 @@ class OpenAIServingChat(OpenAIServing):
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
                          base_model_paths=base_model_paths,
-                         lora_modules=lora_modules,
-                         prompt_adapters=prompt_adapters,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
 
@@ -113,13 +108,8 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         try:
-            (
-                lora_request,
-                prompt_adapter_request,
-            ) = self._maybe_get_adapters(request)
-
             model_config = self.model_config
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+            tokenizer = await self.engine_client.get_tokenizer()
 
             conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
@@ -216,9 +206,7 @@ class OpenAIServingChat(OpenAIServing):
 
             self._log_inputs(request_id,
                              prompt_inputs,
-                             params=sampling_params,
-                             lora_request=lora_request,
-                             prompt_adapter_request=prompt_adapter_request)
+                             params=sampling_params)
 
             engine_inputs = TokensPrompt(
                 prompt_token_ids=prompt_inputs["prompt_token_ids"])
@@ -245,9 +233,7 @@ class OpenAIServingChat(OpenAIServing):
                     engine_inputs,
                     sampling_params,
                     request_id,
-                    lora_request=lora_request,
                     trace_headers=trace_headers,
-                    prompt_adapter_request=prompt_adapter_request,
                     priority=request.priority,
                 )
         except ValueError as e:

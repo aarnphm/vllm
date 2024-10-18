@@ -17,12 +17,9 @@ from vllm.transformers_utils.config import (ConfigFormat, get_config,
                                             get_hf_image_processor_config,
                                             get_hf_text_config)
 from vllm.utils import (GiB_bytes, cuda_device_count_stateless, get_cpu_memory,
-                        is_hip, is_neuron, is_openvino, is_xpu,
-                        print_warning_once)
+                        is_hip, print_warning_once)
 
 if TYPE_CHECKING:
-    from ray.util.placement_group import PlacementGroup
-
     from vllm.executor.executor_base import ExecutorBase
     from vllm.model_executor.model_loader.loader import BaseModelLoader
     from vllm.transformers_utils.tokenizer_group.base_tokenizer_group import (
@@ -39,8 +36,8 @@ class ModelConfig:
 
     Args:
         model: Name or path of the huggingface model to use.
-            It is also used as the content for `model_name` tag in metrics 
-            output when `served_model_name` is not specified. 
+            It is also used as the content for `model_name` tag in metrics
+            output when `served_model_name` is not specified.
         tokenizer: Name or path of the huggingface tokenizer to use.
         tokenizer_mode: Tokenizer mode. "auto" will use the fast tokenizer if
             available, "slow" will always use the slow tokenizer, and
@@ -91,15 +88,11 @@ class ModelConfig:
         skip_tokenizer_init: If true, skip initialization of tokenizer and
             detokenizer.
         served_model_name: The model name used in metrics tag `model_name`,
-            matches the model name exposed via the APIs. If multiple model 
-            names provided, the first name will be used. If not specified, 
+            matches the model name exposed via the APIs. If multiple model
+            names provided, the first name will be used. If not specified,
             the model name will be the same as `model`.
-        limit_mm_per_prompt: Maximum number of data instances per modality 
+        limit_mm_per_prompt: Maximum number of data instances per modality
             per prompt. Only applicable for multimodal models.
-        override_neuron_config: Initialize non default neuron config or 
-            override default neuron config that are specific to Neuron devices, 
-            this argument will be used to configure the neuron config that 
-            can not be gathered from the vllm arguments. 
         config_format: The config format which shall be loaded.
             Defaults to 'auto' which defaults to 'hf'.
         mm_processor_kwargs: Arguments to be forwarded to the model's processor
@@ -131,7 +124,6 @@ class ModelConfig:
                  served_model_name: Optional[Union[str, List[str]]] = None,
                  limit_mm_per_prompt: Optional[Mapping[str, int]] = None,
                  use_async_output_proc: bool = True,
-                 override_neuron_config: Optional[Dict[str, Any]] = None,
                  config_format: ConfigFormat = ConfigFormat.AUTO,
                  mm_processor_kwargs: Optional[Dict[str, Any]] = None) -> None:
         self.model = model
@@ -205,8 +197,6 @@ class ModelConfig:
         self.is_attention_free = self._init_attention_free()
         self.has_inner_state = self._init_has_inner_state()
 
-        self.override_neuron_config = override_neuron_config if is_neuron(
-        ) else None
         self._verify_embedding_mode()
         self._verify_quantization()
         self._verify_cuda_graph()
@@ -273,7 +263,6 @@ class ModelConfig:
             "compressed-tensors", "experts_int8"
         ]
         tpu_supported_quantization = ["tpu_int8"]
-        neuron_supported_quantization = ["neuron_quant"]
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
@@ -328,11 +317,6 @@ class ModelConfig:
                     "Using AWQ quantization with ROCm, but VLLM_USE_TRITON_AWQ"
                     " is not set, enabling VLLM_USE_TRITON_AWQ.")
                 envs.VLLM_USE_TRITON_AWQ = True
-            if is_neuron(
-            ) and self.quantization not in neuron_supported_quantization:
-                raise ValueError(
-                    f"{self.quantization} quantization is currently not "
-                    f"supported in Neuron Backend.")
 
     def _verify_cuda_graph(self) -> None:
         if self.max_seq_len_to_capture is None:
@@ -342,7 +326,7 @@ class ModelConfig:
 
     def _verify_bnb_config(self) -> None:
         """
-        The current version of bitsandbytes (0.44.0) with 8-bit models does not 
+        The current version of bitsandbytes (0.44.0) with 8-bit models does not
         yet support CUDA graph.
         """
         is_bitsandbytes = self.quantization == "bitsandbytes"
@@ -380,12 +364,6 @@ class ModelConfig:
             logger.warning(
                 "Async output processing is only supported for CUDA, TPU, XPU. "
                 "Disabling it for other platforms.")
-            self.use_async_output_proc = False
-            return
-
-        if envs.VLLM_USE_RAY_SPMD_WORKER:
-            logger.warning(
-                "Async output processing can not be enabled with ray spmd")
             self.use_async_output_proc = False
             return
 
@@ -702,8 +680,7 @@ class TokenizerPoolConfig:
     extra_config: dict
 
     def __post_init__(self):
-        if self.pool_type not in ("ray", ) and not isinstance(
-                self.pool_type, type):
+        if not isinstance(self.pool_type, type):
             raise ValueError(f"Unknown pool type: {self.pool_type}")
         if not isinstance(self.extra_config, dict):
             raise ValueError("extra_config must be a dictionary.")
@@ -772,7 +749,7 @@ class LoadConfig:
                 fast weight loading.
             "bitsandbytes" will load nf4 type weights.
         ignore_patterns: The list of patterns to ignore when loading the model.
-            Default to "original/**/*" to avoid repeated loading of llama's 
+            Default to "original/**/*" to avoid repeated loading of llama's
             checkpoints.
 
     """
@@ -822,7 +799,6 @@ class ParallelConfig:
     Args:
         pipeline_parallel_size: Number of pipeline parallel groups.
         tensor_parallel_size: Number of tensor parallel groups.
-        worker_use_ray: Deprecated, use distributed_executor_backend instead.
         max_parallel_loading_workers: Maximum number of multiple batches
             when load model sequentially. To avoid RAM OOM when using tensor
             parallel and large models.
@@ -830,9 +806,6 @@ class ParallelConfig:
             fall back to NCCL.
         tokenizer_pool_config: Config for the tokenizer pool.
             If None, will use synchronous tokenization.
-        ray_workers_use_nsight: Whether to profile Ray workers with nsight, see
-            https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler.
-        placement_group: ray distributed model workers placement group.
         distributed_executor_backend: Backend to use for distributed model
             workers, either "ray" or "mp" (multiprocessing). If either
             pipeline_parallel_size or tensor_parallel_size is greater than 1,
@@ -843,12 +816,9 @@ class ParallelConfig:
         self,
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
-        worker_use_ray: Optional[bool] = None,
         max_parallel_loading_workers: Optional[int] = None,
         disable_custom_all_reduce: bool = False,
         tokenizer_pool_config: Optional[TokenizerPoolConfig] = None,
-        ray_workers_use_nsight: bool = False,
-        placement_group: Optional["PlacementGroup"] = None,
         distributed_executor_backend: Optional[Union[
             str, Type["ExecutorBase"]]] = None,
     ) -> None:
@@ -858,49 +828,13 @@ class ParallelConfig:
         self.max_parallel_loading_workers = max_parallel_loading_workers
         self.disable_custom_all_reduce = disable_custom_all_reduce
         self.tokenizer_pool_config = tokenizer_pool_config
-        self.ray_workers_use_nsight = ray_workers_use_nsight
-        self.placement_group = placement_group
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
-
-        if worker_use_ray:
-            if self.distributed_executor_backend is None:
-                self.distributed_executor_backend = "ray"
-            elif not self.use_ray:
-                raise ValueError(f"worker-use-ray can't be used with "
-                                 f"distributed executor backend "
-                                 f"'{self.distributed_executor_backend}'.")
-
-        if current_platform.is_tpu() and self.world_size > 1:
-            if self.distributed_executor_backend is None:
-                self.distributed_executor_backend = "ray"
-            if self.distributed_executor_backend != "ray":
-                raise ValueError(
-                    "TPU backend only supports Ray for distributed inference.")
 
         if self.distributed_executor_backend is None and self.world_size > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
 
-            from vllm.executor import ray_utils
             backend = "mp"
-            ray_found = ray_utils.ray_is_available()
-            if (current_platform.is_cuda()
-                    and cuda_device_count_stateless() < self.world_size):
-                if not ray_found:
-                    raise ValueError("Unable to load Ray which is "
-                                     "required for multi-node inference, "
-                                     "please install Ray with `pip install "
-                                     "ray`.") from ray_utils.ray_import_err
-                backend = "ray"
-            elif ray_found:
-                if self.placement_group:
-                    backend = "ray"
-                else:
-                    from ray import is_initialized as ray_is_initialized
-                    if ray_is_initialized():
-                        from ray.util import get_current_placement_group
-                        if get_current_placement_group():
-                            backend = "ray"
             self.distributed_executor_backend = backend
             logger.info("Defaulting to use %s for distributed inference",
                         backend)
@@ -908,36 +842,23 @@ class ParallelConfig:
         self._verify_args()
         self.rank: int = 0
 
-    @property
-    def use_ray(self) -> bool:
-        return self.distributed_executor_backend == "ray" or (
-            isinstance(self.distributed_executor_backend, type)
-            and self.distributed_executor_backend.uses_ray)
-
     def _verify_args(self) -> None:
         # Lazy import to avoid circular import
         from vllm.executor.executor_base import ExecutorBase
 
         if self.distributed_executor_backend not in (
-                "ray", "mp", None) and not (isinstance(
+                "mp", None) and not (isinstance(
                     self.distributed_executor_backend, type) and issubclass(
                         self.distributed_executor_backend, ExecutorBase)):
             raise ValueError(
                 "Unrecognized distributed executor backend "
                 f"{self.distributed_executor_backend}. Supported "
-                "values are 'ray', 'mp' or custom ExecutorBase subclass.")
-        if self.use_ray:
-            from vllm.executor import ray_utils
-            ray_utils.assert_ray_available()
+                "values are 'mp' or custom ExecutorBase subclass.")
         if is_hip():
             self.disable_custom_all_reduce = True
             logger.info(
                 "Disabled the custom all-reduce kernel because it is not "
                 "supported on AMD GPUs.")
-        if self.ray_workers_use_nsight and not self.use_ray:
-            raise ValueError("Unable to use nsight profiling unless workers "
-                             "run with Ray.")
-
 
 class SchedulerConfig:
     """Scheduler configuration.
@@ -958,7 +879,7 @@ class SchedulerConfig:
         enable_chunked_prefill: If True, prefill requests can be chunked based
             on the remaining max_num_batched_tokens.
         embedding_mode: Whether the running model is for embedding.
-        preemption_mode: Whether to perform preemption by swapping or 
+        preemption_mode: Whether to perform preemption by swapping or
             recomputation. If not specified, we determine the mode as follows:
             We use recomputation by default since it incurs lower overhead than
             swapping. However, when the sequence group has multiple sequences
@@ -1077,30 +998,14 @@ class DeviceConfig:
             # Automated device type detection
             if current_platform.is_cuda_alike():
                 self.device_type = "cuda"
-            elif is_neuron():
-                self.device_type = "neuron"
-            elif is_openvino():
-                self.device_type = "openvino"
-            elif current_platform.is_tpu():
-                self.device_type = "tpu"
-            elif current_platform.is_cpu():
-                self.device_type = "cpu"
-            elif is_xpu():
-                self.device_type = "xpu"
             else:
                 raise RuntimeError("Failed to infer device type")
         else:
             # Device type is assigned explicitly
             self.device_type = device
 
-        # Some device types require processing inputs on CPU
-        if self.device_type in ["neuron", "openvino"]:
-            self.device = torch.device("cpu")
-        elif self.device_type in ["tpu"]:
-            self.device = None
-        else:
-            # Set device with device type
-            self.device = torch.device(self.device_type)
+        # Set device with device type
+        self.device = torch.device(self.device_type)
 
 
 class SpeculativeConfig:
@@ -1177,7 +1082,7 @@ class SpeculativeConfig:
             typical_acceptance_sampler_posterior_threshold (Optional[float]):
                 A threshold value that sets a lower bound on the posterior
                 probability of a token in the target model for it to be
-                accepted. This threshold is used only when we use the 
+                accepted. This threshold is used only when we use the
                 TypicalAcceptanceSampler for token acceptance.
             typical_acceptance_sampler_posterior_alpha (Optional[float]):
                 A scaling factor for the entropy-based threshold in the
@@ -1187,7 +1092,7 @@ class SpeculativeConfig:
                 If set to False, token log probabilities are returned
                 according to the log probability settings in SamplingParams.
                 If not specified, it defaults to True.
-    
+
         Returns:
             Optional["SpeculativeConfig"]: An instance of SpeculativeConfig if
                 the necessary conditions are met, else None.
@@ -1389,9 +1294,6 @@ class SpeculativeConfig:
             disable_custom_all_reduce=target_parallel_config.
             disable_custom_all_reduce,
             tokenizer_pool_config=target_parallel_config.tokenizer_pool_config,
-            ray_workers_use_nsight=target_parallel_config.
-            ray_workers_use_nsight,
-            placement_group=target_parallel_config.placement_group,
         )
 
         return draft_parallel_config
@@ -1431,13 +1333,13 @@ class SpeculativeConfig:
             typical_acceptance_sampler_posterior_threshold (Optional[float]):
                 A threshold value that sets a lower bound on the posterior
                 probability of a token in the target model for it to be
-                accepted. This threshold is used only when we use the 
+                accepted. This threshold is used only when we use the
                 TypicalAcceptanceSampler for token acceptance.
             typical_acceptance_sampler_posterior_alpha (Optional[float]):
                 A scaling factor for the entropy-based threshold in the
                 TypicalAcceptanceSampler.
             disable_logprobs: If set to True, token log probabilities will not
-                be returned even if requested by sampling parameters. This 
+                be returned even if requested by sampling parameters. This
                 reduces latency by skipping logprob calculation in proposal
                 sampling, target sampling, and after accepted tokens are
                 determined. If set to False, log probabilities will be
@@ -1514,84 +1416,6 @@ class SpeculativeConfig:
             draft_model = self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({draft_model=}, {num_spec_tokens=})"
-
-
-@dataclass
-class LoRAConfig:
-    max_lora_rank: int
-    max_loras: int
-    fully_sharded_loras: bool = False
-    max_cpu_loras: Optional[int] = None
-    lora_dtype: Optional[Union[torch.dtype, str]] = None
-    lora_extra_vocab_size: int = 256
-    # This is a constant.
-    lora_vocab_padding_size: ClassVar[int] = 256
-    long_lora_scaling_factors: Optional[Tuple[float]] = None
-
-    def __post_init__(self):
-        # Setting the maximum rank to 256 should be able to satisfy the vast
-        # majority of applications.
-        possible_max_ranks = (8, 16, 32, 64, 128, 256)
-        possible_lora_extra_vocab_size = (0, 256, 512)
-        if self.max_lora_rank not in possible_max_ranks:
-            raise ValueError(
-                f"max_lora_rank ({self.max_lora_rank}) must be one of "
-                f"{possible_max_ranks}.")
-        if self.lora_extra_vocab_size not in possible_lora_extra_vocab_size:
-            raise ValueError(
-                f"lora_extra_vocab_size ({self.lora_extra_vocab_size}) "
-                f"must be one of {possible_lora_extra_vocab_size}.")
-        if self.max_loras < 1:
-            raise ValueError(f"max_loras ({self.max_loras}) must be >= 1.")
-        if self.max_cpu_loras is None:
-            self.max_cpu_loras = self.max_loras
-        elif self.max_cpu_loras < self.max_loras:
-            raise ValueError(
-                f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
-                f"max_loras ({self.max_loras})")
-
-    def verify_with_model_config(self, model_config: ModelConfig):
-        if self.lora_dtype in (None, "auto"):
-            self.lora_dtype = model_config.dtype
-        elif isinstance(self.lora_dtype, str):
-            self.lora_dtype = getattr(torch, self.lora_dtype)
-        if model_config.quantization and model_config.quantization not in [
-                "awq", "gptq"
-        ]:
-            # TODO support marlin
-            logger.warning("%s quantization is not tested with LoRA yet.",
-                           model_config.quantization)
-
-    def verify_with_scheduler_config(self, scheduler_config: SchedulerConfig):
-        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
-        # If the feature combo become valid
-        if scheduler_config.chunked_prefill_enabled:
-            raise ValueError("LoRA is not supported with chunked prefill yet.")
-
-
-@dataclass
-class PromptAdapterConfig:
-    max_prompt_adapters: int
-    max_prompt_adapter_token: int
-    max_cpu_prompt_adapters: Optional[int] = None
-    prompt_adapter_dtype: Optional[torch.dtype] = None
-
-    def __post_init__(self):
-
-        if self.max_prompt_adapters < 1:
-            raise ValueError(f"max_prompt_adapters "
-                             f"({self.max_prompt_adapters}) must be >= 1.")
-        if self.max_prompt_adapter_token == 0:
-            raise ValueError("max_prompt_adapter_token must be set.")
-        if self.max_cpu_prompt_adapters is None:
-            self.max_cpu_prompt_adapters = self.max_prompt_adapters
-
-    def verify_with_model_config(self, model_config: ModelConfig):
-        if self.prompt_adapter_dtype in (None, "auto"):
-            self.prompt_adapter_dtype = model_config.dtype
-        elif isinstance(self.prompt_adapter_dtype, str):
-            self.prompt_adapter_dtype = getattr(torch,
-                                                self.prompt_adapter_dtype)
 
 
 @dataclass
@@ -1804,10 +1628,10 @@ def get_min_sliding_window(
 def get_served_model_name(model: str,
                           served_model_name: Optional[Union[str, List[str]]]):
     """
-    If the input is a non-empty list, the first model_name in 
-    `served_model_name` is taken. 
-    If the input is a non-empty string, it is used directly. 
-    For cases where the input is either an empty string or an 
+    If the input is a non-empty list, the first model_name in
+    `served_model_name` is taken.
+    If the input is a non-empty string, it is used directly.
+    For cases where the input is either an empty string or an
     empty list, the fallback is to use `self.model`.
     """
     if not served_model_name:
@@ -1832,34 +1656,6 @@ class DecodingConfig:
                              f"must be one of {valid_guided_backends}")
 
 
-@dataclass
-class ObservabilityConfig:
-    """Configuration for observability."""
-    otlp_traces_endpoint: Optional[str] = None
-
-    # Collecting detailed timing information for each request can be expensive.
-
-    # If set, collects the model forward time for the request.
-    collect_model_forward_time: bool = False
-
-    # If set, collects the model execute time for the request.
-    collect_model_execute_time: bool = False
-
-    def __post_init__(self):
-        if not is_otel_available() and self.otlp_traces_endpoint is not None:
-            raise ValueError(
-                "OpenTelemetry is not available. Unable to configure "
-                "'otlp_traces_endpoint'. Ensure OpenTelemetry packages are "
-                f"installed. Original error:\n{otel_import_error_traceback}")
-
-        if ((self.collect_model_forward_time
-             or self.collect_model_execute_time)
-                and self.otlp_traces_endpoint is None):
-            raise ValueError(
-                "collect_model_forward_time or collect_model_execute_time "
-                "requires --otlp-traces-endpoint to be set.")
-
-
 @dataclass(frozen=True)
 class EngineConfig:
     """Dataclass which contains all engine-related configuration. This
@@ -1872,11 +1668,8 @@ class EngineConfig:
     scheduler_config: SchedulerConfig
     device_config: DeviceConfig
     load_config: LoadConfig
-    lora_config: Optional[LoRAConfig]
     speculative_config: Optional[SpeculativeConfig]
     decoding_config: Optional[DecodingConfig]
-    observability_config: Optional[ObservabilityConfig]
-    prompt_adapter_config: Optional[PromptAdapterConfig]
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.
@@ -1886,14 +1679,6 @@ class EngineConfig:
                                                    self.device_config)
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
-
-        if self.lora_config:
-            self.lora_config.verify_with_model_config(self.model_config)
-            self.lora_config.verify_with_scheduler_config(
-                self.scheduler_config)
-        if self.prompt_adapter_config:
-            self.prompt_adapter_config.verify_with_model_config(
-                self.model_config)
 
     def to_dict(self):
         """Return the configs as a dictionary, for use in **kwargs.

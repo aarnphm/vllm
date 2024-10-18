@@ -7,12 +7,10 @@ from vllm.config import DecodingConfig, ModelConfig
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.outputs import (CompletionOutput, EmbeddingRequestOutput,
                           RequestOutput)
 from vllm.pooling_params import PoolingParams
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import collect_from_async_generator, random_uuid
@@ -49,9 +47,7 @@ class EngineClient(ABC):
         prompt: PromptType,
         sampling_params: SamplingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
@@ -70,7 +66,7 @@ class EngineClient(ABC):
         temperature = params.temperature
         length_penalty = params.length_penalty
 
-        tokenizer = await self.get_tokenizer(lora_request=None)
+        tokenizer = await self.get_tokenizer()
         tokenizedPrompt = prompt if isinstance(
             prompt, list) else tokenizer.encode(prompt)
         tokenizedLength = len(tokenizedPrompt)
@@ -157,7 +153,6 @@ class EngineClient(ABC):
         prompt: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> AsyncGenerator[EmbeddingRequestOutput, None]:
@@ -183,10 +178,7 @@ class EngineClient(ABC):
         """Get the decoding configuration of the vLLM engine."""
 
     @abstractmethod
-    async def get_tokenizer(
-        self,
-        lora_request: Optional[LoRARequest] = None,
-    ) -> AnyTokenizer:
+    async def get_tokenizer(self) -> AnyTokenizer:
         """Get the appropriate tokenizer for the request"""
         ...
 

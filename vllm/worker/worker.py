@@ -7,20 +7,18 @@ import torch
 import torch.distributed
 
 import vllm.envs as envs
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
-                         ModelConfig, ObservabilityConfig, ParallelConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig,
+                         ModelConfig, ParallelConfig,
                          PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig)
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.worker.cache_engine import CacheEngine
@@ -51,12 +49,9 @@ class Worker(LocalOrDistributedWorkerBase):
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        lora_config: Optional[LoRAConfig] = None,
         speculative_config: Optional[SpeculativeConfig] = None,
-        prompt_adapter_config: Optional[PromptAdapterConfig] = None,
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
-        observability_config: Optional[ObservabilityConfig] = None,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -67,9 +62,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
-        self.lora_config = lora_config
         self.load_config = load_config
-        self.prompt_adapter_config = prompt_adapter_config
         self.is_driver_worker = is_driver_worker
         if parallel_config and is_driver_worker:
             assert rank % parallel_config.tensor_parallel_size == 0, \
@@ -78,7 +71,6 @@ class Worker(LocalOrDistributedWorkerBase):
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
-        self.observability_config = observability_config
 
         # Return hidden states from target model if the draft model is an
         # mlp_speculator
@@ -92,10 +84,6 @@ class Worker(LocalOrDistributedWorkerBase):
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if model_runner_cls is not None:
             ModelRunnerClass = model_runner_cls
-        elif self._is_embedding_model():
-            ModelRunnerClass = EmbeddingModelRunner
-        elif self._is_encoder_decoder_model():
-            ModelRunnerClass = EncoderDecoderModelRunner
         self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
             model_config,
             parallel_config,
@@ -103,11 +91,8 @@ class Worker(LocalOrDistributedWorkerBase):
             device_config,
             cache_config,
             load_config=load_config,
-            lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
-            prompt_adapter_config=prompt_adapter_config,
-            observability_config=observability_config,
             **speculative_args,
         )
         # Uninitialized cache engine. Will be initialized by
@@ -247,8 +232,6 @@ class Worker(LocalOrDistributedWorkerBase):
                                  cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
-        if self.model_runner.lora_manager:
-            self.model_runner.remove_all_loras()
         gc.collect()
         torch.cuda.empty_cache()
         return num_gpu_blocks, num_cpu_blocks
@@ -399,31 +382,6 @@ class Worker(LocalOrDistributedWorkerBase):
         output = super()._execute_model_spmd(execute_model_req,
                                              intermediate_tensors)
         return output
-
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        return self.model_runner.add_lora(lora_request)
-
-    def remove_lora(self, lora_id: int) -> bool:
-        return self.model_runner.remove_lora(lora_id)
-
-    def pin_lora(self, lora_id: int) -> bool:
-        return self.model_runner.pin_lora(lora_id)
-
-    def list_loras(self) -> Set[int]:
-        return self.model_runner.list_loras()
-
-    def add_prompt_adapter(
-            self, prompt_adapter_request: PromptAdapterRequest) -> bool:
-        return self.model_runner.add_prompt_adapter(prompt_adapter_request)
-
-    def remove_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        return self.model_runner.remove_lora(prompt_adapter_id)
-
-    def pin_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        return self.model_runner.pin_prompt_adapter(prompt_adapter_id)
-
-    def list_prompt_adapters(self) -> Set[int]:
-        return self.model_runner.list_prompt_adapters()
 
     @property
     def max_model_len(self) -> int:

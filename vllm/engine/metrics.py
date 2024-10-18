@@ -7,13 +7,9 @@ import prometheus_client
 
 from vllm.engine.metrics_types import (StatLoggerBase, Stats,
                                        SupportsMetricsInfo)
-from vllm.executor.ray_utils import ray
 from vllm.logger import init_logger
 
-if ray is not None:
-    from ray.util import metrics as ray_metrics
-else:
-    ray_metrics = None
+ray_metrics = None
 
 if TYPE_CHECKING:
     from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
@@ -193,101 +189,9 @@ class Metrics:
                 prometheus_client.REGISTRY.unregister(collector)
 
 
-class _RayGaugeWrapper:
-    """Wraps around ray.util.metrics.Gauge to provide same API as
-    prometheus_client.Gauge"""
-
-    def __init__(self,
-                 name: str,
-                 documentation: str = "",
-                 labelnames: Optional[List[str]] = None,
-                 multiprocess_mode: str = ""):
-        del multiprocess_mode
-        labelnames_tuple = tuple(labelnames) if labelnames else None
-        self._gauge = ray_metrics.Gauge(name=name,
-                                        description=documentation,
-                                        tag_keys=labelnames_tuple)
-
-    def labels(self, **labels):
-        self._gauge.set_default_tags(labels)
-        return self
-
-    def set(self, value: Union[int, float]):
-        return self._gauge.set(value)
-
-
-class _RayCounterWrapper:
-    """Wraps around ray.util.metrics.Counter to provide same API as
-    prometheus_client.Counter"""
-
-    def __init__(self,
-                 name: str,
-                 documentation: str = "",
-                 labelnames: Optional[List[str]] = None):
-        labelnames_tuple = tuple(labelnames) if labelnames else None
-        self._counter = ray_metrics.Counter(name=name,
-                                            description=documentation,
-                                            tag_keys=labelnames_tuple)
-
-    def labels(self, **labels):
-        self._counter.set_default_tags(labels)
-        return self
-
-    def inc(self, value: Union[int, float] = 1.0):
-        if value == 0:
-            return
-        return self._counter.inc(value)
-
-
-class _RayHistogramWrapper:
-    """Wraps around ray.util.metrics.Histogram to provide same API as
-    prometheus_client.Histogram"""
-
-    def __init__(self,
-                 name: str,
-                 documentation: str = "",
-                 labelnames: Optional[List[str]] = None,
-                 buckets: Optional[List[float]] = None):
-        labelnames_tuple = tuple(labelnames) if labelnames else None
-        boundaries = buckets if buckets else []
-        self._histogram = ray_metrics.Histogram(name=name,
-                                                description=documentation,
-                                                tag_keys=labelnames_tuple,
-                                                boundaries=boundaries)
-
-    def labels(self, **labels):
-        self._histogram.set_default_tags(labels)
-        return self
-
-    def observe(self, value: Union[int, float]):
-        return self._histogram.observe(value)
-
-
-class RayMetrics(Metrics):
-    """
-    RayMetrics is used by RayPrometheusStatLogger to log to Ray metrics.
-    Provides the same metrics as Metrics but uses Ray's util.metrics library.
-    """
-    _gauge_cls: Type[prometheus_client.Gauge] = cast(
-        Type[prometheus_client.Gauge], _RayGaugeWrapper)
-    _counter_cls: Type[prometheus_client.Counter] = cast(
-        Type[prometheus_client.Counter], _RayCounterWrapper)
-    _histogram_cls: Type[prometheus_client.Histogram] = cast(
-        Type[prometheus_client.Histogram], _RayHistogramWrapper)
-
-    def __init__(self, labelnames: List[str], max_model_len: int):
-        if ray_metrics is None:
-            raise ImportError("RayMetrics requires Ray to be installed.")
-        super().__init__(labelnames, max_model_len)
-
-    def _unregister_vllm_metrics(self) -> None:
-        # No-op on purpose
-        pass
-
-
 def build_1_2_5_buckets(max_value: int) -> List[int]:
     """
-    Builds a list of buckets with increasing powers of 10 multiplied by 
+    Builds a list of buckets with increasing powers of 10 multiplied by
     mantissa values (1, 2, 5) until the value exceeds the specified maximum.
 
     Example:
@@ -549,11 +453,3 @@ class PrometheusStatLogger(StatLoggerBase):
                 labelnames=metrics_info.keys(),
                 multiprocess_mode="mostrecent")
             info_gauge.labels(**metrics_info).set(1)
-
-
-class RayPrometheusStatLogger(PrometheusStatLogger):
-    """RayPrometheusStatLogger uses Ray metrics instead."""
-    _metrics_cls = RayMetrics
-
-    def info(self, type: str, obj: SupportsMetricsInfo) -> None:
-        return None

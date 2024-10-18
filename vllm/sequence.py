@@ -14,9 +14,7 @@ import msgspec
 import torch
 
 from vllm.inputs.parse import is_encoder_decoder_inputs
-from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
-from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
 
@@ -394,8 +392,6 @@ class Sequence:
         block_size: The block size of the sequence. Should be the same as the
             block size used by the block manager and cache engine.
         eos_token_id: The end-of-sequence (EOS) token id recognized by this LLM.
-        lora_request: LoRA request.
-        prompt_adapter_request: Prompt Adapter request.
         from_decoder_prompt: Construct Sequence from SingletonInputs decoder
                              prompt (True) or encoder prompt (False.) Must be
                              True for decoder-only model.
@@ -408,16 +404,12 @@ class Sequence:
         inputs: "SingletonInputs",
         block_size: int,
         eos_token_id: Optional[int] = None,
-        lora_request: Optional[LoRARequest] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         from_decoder_prompt: bool = True,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = inputs
         self.block_size = block_size
         self.eos_token_id = eos_token_id
-        self.lora_request = lora_request
-        self.prompt_adapter_request = prompt_adapter_request
         self.from_decoder_prompt = from_decoder_prompt
 
         # For decoder-only models, a Sequence is constructed
@@ -505,15 +497,6 @@ class Sequence:
     def mm_processor_kwargs(self) -> Dict[str, Any]:
         return self.inputs.get("mm_processor_kwargs") or {}
 
-    @property
-    def lora_int_id(self) -> int:
-        return self.lora_request.lora_int_id if self.lora_request else 0
-
-    @property
-    def prompt_adapter_id(self) -> int:
-        return self.prompt_adapter_request.prompt_adapter_id \
-                        if self.prompt_adapter_request else 0
-
     def get_output_text_to_return(self, buffer_length: int,
                                   delta: bool) -> str:
         """If delta is True, only new text since the last call to
@@ -565,7 +548,7 @@ class Sequence:
         # this in the future.
         num_tokens = self.num_hashed_tokens_of_block(logical_idx)
         hashed_tokens = self.data.get_prefix_token_ids(num_tokens)
-        return hash((hashed_tokens, self.lora_int_id))
+        return hash((hashed_tokens, 0))
 
     def num_hashed_tokens_of_block(self, logical_idx: int):
         return logical_idx * self.block_size + self.block_size
@@ -653,7 +636,6 @@ class SequenceGroup:
         seqs: The list of sequences.
         sampling_params: The sampling parameters used to generate the outputs.
         arrival_time: The arrival time of the request.
-        lora_request: LoRA request.
         embeddings: The embeddings vectors of the prompt of the sequence group
             for an embedding model.
         pooling_params: The pooling parameters used to generate the pooling
@@ -661,7 +643,6 @@ class SequenceGroup:
         encoder_seq: Optional, the single encoder sequence. Should be None
                      unless you are working with an encoder/decoder model.
         trace_headers: OpenTelemetry trace headers.
-        prompt_adapter_request: Prompt Adapter request.
         priority: User-defined priority of the request.
     """
 
@@ -671,12 +652,10 @@ class SequenceGroup:
         seqs: List[Sequence],
         arrival_time: float,
         sampling_params: Optional[SamplingParams] = None,
-        lora_request: Optional[LoRARequest] = None,
         embeddings: Optional[List[float]] = None,
         pooling_params: Optional[PoolingParams] = None,
         encoder_seq: Optional[Sequence] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> None:
         self.request_id = request_id
@@ -691,12 +670,10 @@ class SequenceGroup:
                                       first_scheduled_time=None,
                                       first_token_time=None,
                                       time_in_queue=None)
-        self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
         self.embeddings = embeddings
         self.pooling_params = pooling_params
-        self.prompt_adapter_request = prompt_adapter_request
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
@@ -744,20 +721,6 @@ class SequenceGroup:
         # provided per request; note that are independent of whether the model
         # decoder-only or an encoder-decoder).
         return self.seqs[0].mm_processor_kwargs
-
-    @property
-    def lora_int_id(self) -> int:
-        return self.lora_request.lora_int_id if self.lora_request else 0
-
-    @property
-    def prompt_adapter_id(self) -> int:
-        return self.prompt_adapter_request.prompt_adapter_id \
-                        if self.prompt_adapter_request else 0
-
-    @property
-    def prompt_adapter_num_virtual_tokens(self) -> int:
-        return self.prompt_adapter_request.prompt_adapter_num_virtual_tokens\
-                         if self.prompt_adapter_request else 0
 
     def init_multi_step(self, num_steps: int) -> None:
         self.state.num_steps = num_steps
@@ -979,14 +942,13 @@ class SequenceGroupMetadata(
             query tokens for prefill, we don't need sampling.
         token_chunk_size: The number of tokens to be processed (per sequence).
             None if chunking is not required.
-        lora_request: LoRA request.
         computed_block_nums: The block numbers that are already computed,
             used in prefix caching.
         state: Internal state tied to this sequence group.
         multi_modal_data: Multi modal data.
         mm_processor_kwargs: Multimodal input processor / mapper overrides.
         encoder_seq_data: Optional sequence data for encoder prompt
-                          (SequenceGroup.encoder_seq). Should be None 
+                          (SequenceGroup.encoder_seq). Should be None
                           unless you are working with an encoder/decoder
                           model.
         cross_block_table: Optional cross-attention block table associated
@@ -994,7 +956,6 @@ class SequenceGroupMetadata(
                            (SequenceGroup.encoder_seq). Should be None
                            unless you are working with an encoder/decoder
                            model.
-        prompt_adapter_request: Prompt Adapter request.
     """
 
     request_id: str
@@ -1004,7 +965,6 @@ class SequenceGroupMetadata(
     block_tables: Dict[int, List[int]]
     do_sample: bool = True
     pooling_params: Optional[PoolingParams] = None
-    lora_request: Optional[LoRARequest] = None
     computed_block_nums: Optional[List[int]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
@@ -1014,7 +974,6 @@ class SequenceGroupMetadata(
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     encoder_seq_data: Optional[SequenceData] = None
     cross_block_table: Optional[List[int]] = None
-    prompt_adapter_request: Optional[PromptAdapterRequest] = None
     token_chunk_size: Optional[int] = None
 
     ### Stateful fields that are lazily defined. ###
@@ -1032,19 +991,6 @@ class SequenceGroupMetadata(
             else:
                 self.token_chunk_size = 1
 
-    @property
-    def lora_int_id(self) -> int:
-        return self.lora_request.lora_int_id if self.lora_request else 0
-
-    @property
-    def prompt_adapter_id(self) -> int:
-        return self.prompt_adapter_request.prompt_adapter_id \
-                        if self.prompt_adapter_request else 0
-
-    @property
-    def prompt_adapter_num_virtual_tokens(self) -> int:
-        return self.prompt_adapter_request.prompt_adapter_num_virtual_tokens \
-                        if self.prompt_adapter_request else 0
 
     # Multi-Step Chunked-Prefill property
     @property

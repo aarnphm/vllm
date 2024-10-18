@@ -23,105 +23,10 @@ logger = init_logger(__name__)
 # yapf: disable
 _TEXT_GENERATION_MODELS = {
     # [Decoder-only]
-    "AquilaModel": ("llama", "LlamaForCausalLM"),
-    "AquilaForCausalLM": ("llama", "LlamaForCausalLM"),  # AquilaChat2
-    "ArcticForCausalLM": ("arctic", "ArcticForCausalLM"),
-    "BaiChuanForCausalLM": ("baichuan", "BaiChuanForCausalLM"),  # baichuan-7b
-    "BaichuanForCausalLM": ("baichuan", "BaichuanForCausalLM"),  # baichuan-13b
-    "BloomForCausalLM": ("bloom", "BloomForCausalLM"),
-    # ChatGLMModel supports multimodal
-    "CohereForCausalLM": ("commandr", "CohereForCausalLM"),
-    "DbrxForCausalLM": ("dbrx", "DbrxForCausalLM"),
-    "DeciLMForCausalLM": ("decilm", "DeciLMForCausalLM"),
-    "DeepseekForCausalLM": ("deepseek", "DeepseekForCausalLM"),
-    "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
-    "ExaoneForCausalLM": ("exaone", "ExaoneForCausalLM"),
-    "FalconForCausalLM": ("falcon", "FalconForCausalLM"),
-    "GemmaForCausalLM": ("gemma", "GemmaForCausalLM"),
-    "Gemma2ForCausalLM": ("gemma2", "Gemma2ForCausalLM"),
-    "GPT2LMHeadModel": ("gpt2", "GPT2LMHeadModel"),
-    "GPTBigCodeForCausalLM": ("gpt_bigcode", "GPTBigCodeForCausalLM"),
-    "GPTJForCausalLM": ("gpt_j", "GPTJForCausalLM"),
-    "GPTNeoXForCausalLM": ("gpt_neox", "GPTNeoXForCausalLM"),
-    "GraniteForCausalLM": ("granite", "GraniteForCausalLM"),
-    "GraniteMoeForCausalLM": ("granitemoe", "GraniteMoeForCausalLM"),
-    "InternLMForCausalLM": ("llama", "LlamaForCausalLM"),
-    "InternLM2ForCausalLM": ("internlm2", "InternLM2ForCausalLM"),
-    "JAISLMHeadModel": ("jais", "JAISLMHeadModel"),
-    "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
-    # For decapoda-research/llama-*
-    "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
-    "MambaForCausalLM": ("mamba", "MambaForCausalLM"),
-    "MistralForCausalLM": ("llama", "LlamaForCausalLM"),
-    "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
-    "QuantMixtralForCausalLM": ("mixtral_quant", "MixtralForCausalLM"),
-    # transformers's mpt class has lower case
-    "MptForCausalLM": ("mpt", "MPTForCausalLM"),
-    "MPTForCausalLM": ("mpt", "MPTForCausalLM"),
-    "MiniCPMForCausalLM": ("minicpm", "MiniCPMForCausalLM"),
-    "MiniCPM3ForCausalLM": ("minicpm3", "MiniCPM3ForCausalLM"),
-    "NemotronForCausalLM": ("nemotron", "NemotronForCausalLM"),
-    "OlmoForCausalLM": ("olmo", "OlmoForCausalLM"),
-    "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
-    "OPTForCausalLM": ("opt", "OPTForCausalLM"),
-    "OrionForCausalLM": ("orion", "OrionForCausalLM"),
-    "PersimmonForCausalLM": ("persimmon", "PersimmonForCausalLM"),
-    "PhiForCausalLM": ("phi", "PhiForCausalLM"),
-    "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
-    "Phi3SmallForCausalLM": ("phi3_small", "Phi3SmallForCausalLM"),
-    "PhiMoEForCausalLM": ("phimoe", "PhiMoEForCausalLM"),
-    # QWenLMHeadModel supports multimodal
-    "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
-    "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
-    "RWForCausalLM": ("falcon", "FalconForCausalLM"),
-    "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
-    "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
-    "Starcoder2ForCausalLM": ("starcoder2", "Starcoder2ForCausalLM"),
-    "SolarForCausalLM": ("solar", "SolarForCausalLM"),
-    "XverseForCausalLM": ("xverse", "XverseForCausalLM"),
-    # [Encoder-decoder]
-    "BartModel": ("bart", "BartForConditionalGeneration"),
-    "BartForConditionalGeneration": ("bart", "BartForConditionalGeneration"),
-}
-
-_EMBEDDING_MODELS = {
-    # [Text-only]
-    "BertModel": ("bert", "BertEmbeddingModel"),
-    "Gemma2Model": ("gemma2", "Gemma2EmbeddingModel"),
-    "MistralModel": ("llama", "LlamaEmbeddingModel"),
-    "Qwen2ForRewardModel": ("qwen2_rm", "Qwen2ForRewardModel"),
-    # [Multimodal]
-    "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
-}
-
-_MULTIMODAL_MODELS = {
-    # [Decoder-only]
-    "Blip2ForConditionalGeneration": ("blip2", "Blip2ForConditionalGeneration"),
-    "ChameleonForConditionalGeneration": ("chameleon", "ChameleonForConditionalGeneration"),  # noqa: E501
-    "ChatGLMModel": ("chatglm", "ChatGLMForCausalLM"),
-    "ChatGLMForConditionalGeneration": ("chatglm", "ChatGLMForCausalLM"),
-    "FuyuForCausalLM": ("fuyu", "FuyuForCausalLM"),
-    "InternVLChatModel": ("internvl", "InternVLChatModel"),
-    "LlavaForConditionalGeneration": ("llava", "LlavaForConditionalGeneration"),
-    "LlavaNextForConditionalGeneration": ("llava_next", "LlavaNextForConditionalGeneration"),  # noqa: E501
-    "LlavaNextVideoForConditionalGeneration": ("llava_next_video", "LlavaNextVideoForConditionalGeneration"),  # noqa: E501
-    "LlavaOnevisionForConditionalGeneration": ("llava_onevision", "LlavaOnevisionForConditionalGeneration"),  # noqa: E501
-    "MiniCPMV": ("minicpmv", "MiniCPMV"),
-    "MolmoForCausalLM": ("molmo", "MolmoForCausalLM"),
-    "NVLM_D": ("nvlm_d", "NVLM_D_Model"),
-    "PaliGemmaForConditionalGeneration": ("paligemma", "PaliGemmaForConditionalGeneration"),  # noqa: E501
-    "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
-    "PixtralForConditionalGeneration": ("pixtral", "PixtralForConditionalGeneration"),  # noqa: E501
-    "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),
-    "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
-    "UltravoxModel": ("ultravox", "UltravoxModel"),
-    # [Encoder-decoder]
-    "MllamaForConditionalGeneration": ("mllama", "MllamaForConditionalGeneration"),  # noqa: E501
 }
 
 _SPECULATIVE_DECODING_MODELS = {
-    "EAGLEModel": ("eagle", "EAGLE"),
     "MedusaModel": ("medusa", "Medusa"),
     "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
 }
@@ -129,8 +34,6 @@ _SPECULATIVE_DECODING_MODELS = {
 
 _VLLM_MODELS = {
     **_TEXT_GENERATION_MODELS,
-    **_EMBEDDING_MODELS,
-    **_MULTIMODAL_MODELS,
     **_SPECULATIVE_DECODING_MODELS,
 }
 

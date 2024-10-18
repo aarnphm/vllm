@@ -33,11 +33,8 @@ class MultiStepWorker(Worker):
             base_model_runner.device_config,
             base_model_runner.cache_config,
             load_config=base_model_runner.load_config,
-            lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=base_model_runner.is_driver_worker,
-            prompt_adapter_config=base_model_runner.prompt_adapter_config,
-            observability_config=base_model_runner.observability_config,
         )
 
         pipeline_parallel_size = self.parallel_config.pipeline_parallel_size
@@ -104,8 +101,8 @@ class MultiStepWorker(Worker):
         execute_model_req: ExecuteModelRequest,
         model_input: StatefulModelInput,
     ) -> None:
-        """ 
-        Prepare the last sampled token ids for TP workers. If it's the last 
+        """
+        Prepare the last sampled token ids for TP workers. If it's the last
         PP rank, then the last sampled token ids are already in the model_input.
         If it is NOT the last PP rank, then we need to get the last sampled
         token that is cached in the execute_model_req.
