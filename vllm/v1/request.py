@@ -206,7 +206,7 @@ class Request:
     def is_grammar_ready(self) -> bool:
         if isinstance(self._grammar, Future):
             return not self._grammar.running() and self._grammar.done()
-        return (self.status == RequestStatus.WAITING
+        return (self.status == RequestStatus.WAITING or self.status == RequestStatus.RUNNING
                 and self._grammar is not None)
 
     @property
