@@ -36,6 +36,18 @@ class StructuredOutputGrammar(ABC):
         """
 
     @abstractmethod
+    def jump_forward(self, request_id: str) -> list[int]:
+      """
+      Determine the list of jump tokens that this request can jump forward
+
+      Args:
+        request_id (str): The unique indentifier for the request
+
+      Returns:
+        list of str: List of tokens that can be jumped.
+      """
+
+    @abstractmethod
     def validate_tokens(self, tokens: list[int]) -> list[int]:
         """
         Validates the provided tokens against the grammar.

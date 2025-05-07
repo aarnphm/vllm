@@ -118,6 +118,11 @@ class GuidanceGrammar(StructuredOutputGrammar):
                 self.printed_error = True
                 logger.warning("LLMatcher error: %s", err)
 
+    def jump_forward(
+        self,
+        request_id: str,
+    ) -> list[int]: ...
+
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the parser.
 
