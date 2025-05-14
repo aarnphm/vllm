@@ -45,6 +45,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mlp import MlpProposer
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
@@ -192,6 +193,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                                  self.device)  # type: ignore
                     if self.speculative_config.method == "eagle3":
                         self.use_aux_hidden_state_outputs = True
+                elif self.speculative_config.method == 'mlp_speculator':
+                    self.drafter = MlpProposer(self.vllm_config, self.device)
                 else:
                     raise ValueError("Unknown speculative decoding method: "
                                      f"{self.speculative_config.method}")
@@ -1325,6 +1328,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
 
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                target_slot_mapping=target_slot_mapping,
+                next_token_ids=next_token_ids,
+                cu_num_tokens=cu_num_tokens,
+                block_table=eagle_attn_metadata.block_table,
+                sampling_metadata=sampling_metadata,
+            )
+            spec_token_ids = draft_token_ids.tolist()
+        elif self.speculative_config.method == "mlp_speculator":
+            # PERFORM HERE
+            if TYPE_CHECKING:
+                assert isinstance(self.drafter, MlpProposer)
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
