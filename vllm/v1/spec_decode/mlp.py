@@ -4,10 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from vllm.attention.layer import Attention
-from vllm.config import (SpeculativeConfig, VllmConfig,
-                         get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.config import SpeculativeConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.models import ModelRegistry
 from vllm.utils import LazyLoader
@@ -30,7 +29,6 @@ class MlpProposer:
 
     speculative_config: SpeculativeConfig = field(init=False, repr=False)
     model: nn.Module = field(init=False, repr=False)
-    attn_layer_name: str = field(init=False, repr=False)
 
     def __post_init__(self):
         if self.vllm_config.speculative_config is None:
@@ -60,10 +58,9 @@ class MlpProposer:
         ...
 
     def load_model(self, target_model: nn.Module) -> None:
+        loader = get_model_loader(self.vllm_config.load_config)
         target_layer_num = self.vllm_config.model_config.get_num_layers(
             self.vllm_config.parallel_config)
-        target_attn_layer_names = set(
-            get_layers_from_vllm_config(self.vllm_config, Attention).keys())
 
         draft_model_config = \
             self.speculative_config.draft_model_config
@@ -80,8 +77,5 @@ class MlpProposer:
                 start_layer_id=target_layer_num,
             ).to(target_device)
 
-        draft_attn_layer_names = (
-            get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
-            target_attn_layer_names)
-        assert len(draft_attn_layer_names) == 1
-        self.attn_layer_name = next(iter(draft_attn_layer_names))
+        weights = loader.get_all_weights(draft_model_config, self.model)
+        self.model.load_weights(weights)

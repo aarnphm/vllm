@@ -194,7 +194,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculative_config.method == "eagle3":
                         self.use_aux_hidden_state_outputs = True
                 elif self.speculative_config.method == 'mlp_speculator':
-                    self.drafter = MlpProposer(self.vllm_config, self.device)
+                    self.drafter = MlpProposer(self.vllm_config,
+                                               self.device)  # type: ignore
                 else:
                     raise ValueError("Unknown speculative decoding method: "
                                      f"{self.speculative_config.method}")
