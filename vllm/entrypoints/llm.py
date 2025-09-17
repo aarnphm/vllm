@@ -11,7 +11,6 @@ from pydantic import ValidationError
 from tqdm.auto import tqdm
 from typing_extensions import TypeVar
 
-import vllm.envs as envs
 from vllm.beam_search import (BeamSearchInstance, BeamSearchOutput,
                               BeamSearchSequence,
                               create_sort_beams_key_function)
@@ -278,7 +277,7 @@ class LLM:
 
         log_non_default_args(engine_args)
 
-        # Create the Engine (autoselects V0 vs V1)
+        # Create the Engine
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.engine_class = type(self.llm_engine)
@@ -286,11 +285,7 @@ class LLM:
         self.request_counter = Counter()
         self.default_sampling_params: Union[dict[str, Any], None] = None
 
-        if envs.VLLM_USE_V1:
-            supported_tasks = self.llm_engine \
-                .get_supported_tasks()  # type: ignore
-        else:
-            supported_tasks = self.llm_engine.model_config.supported_tasks
+        supported_tasks = self.llm_engine.get_supported_tasks()
 
         logger.info("Supported_tasks: %s", supported_tasks)
 
@@ -1519,7 +1514,7 @@ class LLM:
     ):
         """
         Validate that if any multi-modal data is skipped (i.e. None),
-        then its corresponding UUID must be set. 
+        then its corresponding UUID must be set.
         """
         if multi_modal_data is None:
             return
