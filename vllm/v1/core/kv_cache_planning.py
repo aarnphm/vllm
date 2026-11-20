@@ -1825,7 +1825,7 @@ def finalize_extensible_kv_cache(
         builder = get_kv_cache_config_builder(vllm_config)
         groups_per_worker = [config.kv_cache_groups for config in kv_cache_configs]
         available_memory = [
-            (num_blocks - 1)
+            (num_blocks - first_request_block_id(groups))
             * _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
             if groups
             else 0

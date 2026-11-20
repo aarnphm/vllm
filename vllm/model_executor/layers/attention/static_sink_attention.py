@@ -4,7 +4,7 @@ import functools
 
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
@@ -47,11 +47,14 @@ def create_static_sink_attention_backend(
             model_config = vllm_config.model_config
             scheduler_config = vllm_config.scheduler_config
             self.sink_len = sink_len
-            self.block_size = vllm_config.cache_config.block_size
-            self.num_sink_blocks = self.sink_len // vllm_config.cache_config.block_size
-            self.max_num_blocks = cdiv(
-                model_config.max_model_len, vllm_config.cache_config.block_size
+            # The group's resolved block size, which the planner may have grown
+            # past `CacheConfig.block_size` and the scheduler reserves in.
+            self.block_size = kv_cache_spec.block_size
+            sink_block_ids = SinkFullAttentionManager.sink_block_ids(
+                SinkFullAttentionManager.config(sink_len=sink_len), self.block_size
             )
+            self.num_sink_blocks = len(sink_block_ids)
+            self.max_num_blocks = cdiv(model_config.max_model_len, self.block_size)
             self.block_table_with_sink = torch.zeros(
                 (
                     scheduler_config.max_num_seqs,
@@ -61,8 +64,8 @@ def create_static_sink_attention_backend(
                 dtype=torch.int32,
             )
             self.block_table_with_sink[:, : self.num_sink_blocks] = torch.arange(
-                1,
-                self.num_sink_blocks + 1,
+                sink_block_ids.start,
+                sink_block_ids.stop,
                 device=device,
                 dtype=torch.int32,
             )
@@ -104,9 +107,12 @@ def create_static_sink_attention_backend(
             """Write the sink KV into blocks 1..sink_len // block_size, which no
             request owns, with the backend's own KV cache writer."""
             assert layer.sink_key is not None and layer.sink_value is not None
+            # The writer's own block size: the view is `[blocks, kv_heads,
+            # block_tokens, K | V]` in the group's resolved blocks.
+            block_size = kv_cache.shape[2]
             slot_mapping = torch.arange(
-                layer.block_size,
-                layer.block_size + sink_len,
+                block_size,
+                block_size + sink_len,
                 device=kv_cache.device,
                 dtype=torch.long,
             )
@@ -156,6 +162,12 @@ class StaticSinkAttention(Attention, CustomOp):
         cache_config: CacheConfig | None = None,
         **kwargs,
     ):
+        if get_current_vllm_config().parallel_config.decode_context_parallel_size > 1:
+            # Each rank keeps the whole sink in its blocks 1..sink_len //
+            # block_size, but DCP-scaled scheduler blocks would reserve fewer.
+            raise ValueError(
+                "StaticSinkAttention does not support decode context parallelism."
+            )
         dtype = torch.get_default_dtype()
 
         if cache_config is not None:
