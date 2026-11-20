@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -37,6 +38,79 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionLaw:
+    """Which positions a windowed cache keeps once n tokens are computed:
+    `[tail(n), n)`. Policy as data: a windowed manager declares its law and
+    the shared mechanisms (freeing, prefix-hit search) read it.
+
+    window: tokens kept behind n for attention (sliding window W keeps W - 1).
+    chunk:  chunked local attention; the tail is n's chunk boundary.
+    margin: extra tokens kept behind the tail when freeing (multi-module spec
+            decode re-prefills them); prefix hits ignore it.
+    """
+
+    window: int = 0
+    chunk: int = 0
+    margin: int = 0
+
+    def tail(self, n: int, margin: int = 0) -> int:
+        if self.chunk:
+            return n // self.chunk * self.chunk
+        return max(0, n - self.window - margin)
+
+    def skipped_tokens(self, num_computed_tokens: int) -> int:
+        return self.tail(num_computed_tokens, self.margin)
+
+    def first_needed_block(self, h: int, block_size: int) -> int:
+        return self.tail(h) // block_size
+
+
+def _longest_law_hit(
+    block_hashes: BlockHashList,
+    max_length: int,
+    kv_cache_group_ids: list[int],
+    block_pool: BlockPool,
+    block_size: int,
+    alignment_tokens: int,
+    first_needed_block: Callable[[int], int],
+) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    """Longest prefix hit for a windowed retention law, as data.
+
+    A layer that keeps `[t(n), n)` resumes at h tokens when the blocks
+    `[first_needed_block(h), h / block_size)` are all cached. Candidates are
+    multiples of `alignment_tokens` (and of the block), largest first; a miss
+    at block j rules out every candidate that needs j, so the next candidate
+    is the largest one ending at or before block j. Each block is looked up
+    at most once. Blocks before the needed range are the null block.
+    """
+    step = math.lcm(block_size, alignment_tokens)
+    h = max_length // step * step
+    cached: dict[int, list[KVCacheBlock] | None] = {}
+
+    def lookup(j: int) -> list[KVCacheBlock] | None:
+        if j not in cached:
+            cached[j] = block_pool.get_cached_block(block_hashes[j], kv_cache_group_ids)
+        return cached[j]
+
+    while h > 0:
+        hi = h // block_size
+        lo = min(first_needed_block(h), hi)
+        miss = next((j for j in range(hi - 1, lo - 1, -1) if not lookup(j)), None)
+        if miss is None:
+            break
+        h = miss * block_size // step * step
+    hi = h // block_size
+    lo = min(first_needed_block(h), hi) if h > 0 else 0
+    computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+        [block_pool.null_block] * lo for _ in kv_cache_group_ids
+    )
+    for j in range(lo, hi):
+        for computed, block in zip(computed_blocks, lookup(j)):  # type: ignore[arg-type]
+            computed.append(block)
+    return computed_blocks, h
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -854,18 +928,21 @@ class SingleTypeKVCacheManager(ABC):
         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
+    @classmethod
+    def retention_law(cls, config: ManagerConfig) -> RetentionLaw | None:
+        """The window this manager's layers keep, or None if they keep every
+        token (full attention) or are not positional (Mamba)."""
+        return None
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """Get the number of tokens that will be skipped for attention computation.
+        """Tokens before the first one a future token can attend to.
 
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-
+        Read off the manager's retention law; 0 when it keeps every token.
         """
-        # The default behavior is to not skip any tokens.
-        return 0
+        law = type(self).retention_law(self.manager_config)
+        if law is None:
+            return 0
+        return law.skipped_tokens(num_computed_tokens)
 
     def new_step_starts(self) -> None:
         return None
@@ -1096,6 +1173,14 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return params.sliding_window - 1 + params.extra_retained_tokens
 
     @classmethod
+    def retention_law(cls, config: ManagerConfig) -> RetentionLaw:
+        params = config.params
+        assert isinstance(params, SlidingWindowManager.Params)
+        return RetentionLaw(
+            window=params.sliding_window - 1, margin=params.extra_retained_tokens
+        )
+
+    @classmethod
     def max_admission_blocks(
         cls,
         config: ManagerConfig,
@@ -1176,63 +1261,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             alignment_tokens=alignment_tokens,
         )
 
-        # The number of contiguous blocks needed for a prefix cache hit.
-        sliding_window_contiguous_blocks = cdiv(
-            manager_config.params.sliding_window - 1, block_size
+        # A hit at h tokens needs the blocks covering [h - (W - 1), h).
+        law = cls.retention_law(manager_config)
+        return _longest_law_hit(
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            block_size,
+            alignment_tokens,
+            first_needed_block=lambda h: law.first_needed_block(h, block_size),
         )
-
-        # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
-        # optimize the time complexity from O(max_num_blocks) to
-        # O(max_num_blocks / sliding_window_contiguous_blocks +
-        # sliding_window_contiguous_blocks),
-        # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // block_size
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [block_pool.null_block] * max_num_blocks
-            for _ in range(len(kv_cache_group_ids))
-        )
-        num_contiguous_blocks = 0
-        match_found = False
-        # Search from right to left and early stop when a match is found.
-        for i in range(max_num_blocks - 1, -1, -1):
-            if cached_block := block_pool.get_cached_block(
-                block_hashes[i], kv_cache_group_ids
-            ):
-                # Skip prefix matching check if the block is not aligned with
-                # `alignment_tokens`.
-                if (
-                    num_contiguous_blocks == 0
-                    and block_size != alignment_tokens
-                    and ((i + 1) * block_size) % alignment_tokens != 0
-                ):
-                    continue
-                # Add the cached block to the computed blocks.
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed[i] = cached
-                num_contiguous_blocks += 1
-                if num_contiguous_blocks >= sliding_window_contiguous_blocks:
-                    # Trim the trailing blocks.
-                    # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
-                    # when sliding_window_contiguous_blocks=2.
-                    for computed in computed_blocks:
-                        del computed[i + num_contiguous_blocks :]
-                    match_found = True
-                    break
-            else:
-                num_contiguous_blocks = 0
-        if not match_found:
-            # The first `num_contiguous_blocks` is a cache hit even if
-            # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
-            for computed in computed_blocks:
-                del computed[num_contiguous_blocks:]
-            while (
-                block_size != alignment_tokens  # Faster for common case.
-                and len(computed_blocks[0]) * block_size % alignment_tokens != 0
-            ):
-                for computed in computed_blocks:
-                    computed.pop()
-        hit_length = len(computed_blocks[0]) * block_size
-        return computed_blocks, hit_length
 
     @classmethod
     def reachable_block_mask(
@@ -1306,40 +1345,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     mask[j - start_block] = True
 
         return mask
-
-    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """Get the number of tokens that will be skipped for attention computation.
-
-        For sliding window, this corresponds to the tokens that are prior to
-        the current sliding window.
-
-        Example:
-        sliding_window=4, num_computed_tokens=7
-
-        Tokens:   [ 0  1  2  3  4  5  6  7 ]
-                  | ---- computed -----|
-                                         ^ next token to be computed
-                               |-----------| sliding window for next token
-                  |--skipped---|
-
-        The current window contains tokens 4~7. Tokens 0~3 will be skipped for
-        attention computation since they are outside the sliding window.
-        Thus, get_num_skipped_tokens(7) == 4.
-
-        The trailing edge of the window is extended by `extra_retained_tokens`
-        so that those extra trailing tokens' blocks are retained (but not
-        attended). This is needed for multi-module spec decoding which can
-        re-prefill the last num_spec_prefill_tokens - 1 tokens from the end
-        of the sequence, and thus needs to delay freeing/caching of blocks.
-
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-
-        """
-        return max(0, num_computed_tokens - self.num_retained_tokens)
 
 
 class DFlashSlidingWindowManager(SlidingWindowManager):
@@ -1705,6 +1710,12 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         self.attention_chunk_size = self.manager_config.params.attention_chunk_size
 
     @classmethod
+    def retention_law(cls, config: ManagerConfig) -> RetentionLaw:
+        params = config.params
+        assert isinstance(params, ChunkedLocalAttentionManager.Params)
+        return RetentionLaw(chunk=params.attention_chunk_size)
+
+    @classmethod
     def find_longest_cache_hit(
         cls,
         block_hashes: BlockHashList,
@@ -1772,79 +1783,18 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
-        max_num_blocks = max_length // block_size
-        if max_length > 0:
-            local_attention_start_idx = (
-                max_length // params.attention_chunk_size * params.attention_chunk_size
-            )
-        else:
-            local_attention_start_idx = 0
-        # we marked blocks out of window as computed
-        # with null blocks, and blocks inside window based on cache lookup
-        # result [null] [null] ... [null] [hit block 1 (1st block contain
-        # last window)] [hit block 2] ... [hit block x]
-        local_attention_start_block_idx = local_attention_start_idx // block_size
-        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-            [block_pool.null_block] * local_attention_start_block_idx
-            for _ in range(len(kv_cache_group_ids))
+        # A hit at h tokens needs the blocks of h's own chunk before h; a hit
+        # on a chunk boundary needs nothing.
+        law = cls.retention_law(manager_config)
+        return _longest_law_hit(
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            block_size,
+            alignment_tokens,
+            first_needed_block=lambda h: law.first_needed_block(h, block_size),
         )
-        for i in range(local_attention_start_block_idx, max_num_blocks):
-            block_hash = block_hashes[i]
-            if cached_block := block_pool.get_cached_block(
-                block_hash, kv_cache_group_ids
-            ):
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed.append(cached)
-            else:
-                break
-        hit_length = len(computed_blocks[0]) * block_size
-        return computed_blocks, hit_length
-
-    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """Get the number of tokens that will be skipped for attention computation.
-
-        For chunked local attention, this corresponds to the tokens that are on
-        the left side of the current chunk.
-
-        Example 1:
-        chunk size = 8, num_computed_tokens = 13
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 | ----- computed ---------------|
-                                                  ^^ next token to be computed
-                                   |----------------| <-- attention window for
-                                                          next token
-                 |--- skipped -----|
-        Output: get_num_skipped_tokens(13) == 8
-
-        Example 2:
-        chunk size = 8, num_computed_tokens = 8
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 | --- computed ---|
-                                     ^ next token to be computed
-                                   |--| <-- attention window for next token
-                 | --- skipped ----|
-        Output: get_num_skipped_tokens(8) == 8
-
-        Example 3:
-        chunk size = 8, num_computed_tokens = 7
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 |---computed---|
-                                 ^ next token to be computed
-                 |-----------------| <-- attention window for next token
-                 no token should be skipped.
-        Output: get_num_skipped_tokens(7) == 0
-
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-
-        """
-        num_skipped_tokens = (
-            num_computed_tokens // self.attention_chunk_size
-        ) * self.attention_chunk_size
-        return num_skipped_tokens
 
 
 class MambaManager(SingleTypeKVCacheManager):
