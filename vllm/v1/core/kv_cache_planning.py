@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from functools import partial, reduce
+from itertools import zip_longest
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -999,11 +1000,17 @@ def _get_packed_kv_cache_groups(
             num_groups = max(
                 num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
             )
+        # A state bucket can mix page sizes in unequal counts, so a repeat holds
+        # at most one layer of each size and every group gets at least one.
+        pattern_repeats = [
+            [name for name in repeat if name is not None]
+            for repeat in zip_longest(*page_size_layers.values())
+        ]
+        num_groups = min(num_groups, len(pattern_repeats))
         if num_groups == 1:
             groups.append(spec)
             continue
 
-        pattern_repeats = list(zip(*page_size_layers.values()))
         for i in range(num_groups):
             group_layer_names = [
                 name for repeat in pattern_repeats[i::num_groups] for name in repeat

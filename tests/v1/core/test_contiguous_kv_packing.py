@@ -616,6 +616,33 @@ class TestSlidingWindowBucketCap:
             f"layers.{i}.swa" for i in range(43)
         )
 
+    @pytest.mark.parametrize(
+        "full_kv_heads",
+        [pytest.param(1, id="empty-group"), pytest.param(6, id="dropped-layer")],
+    )
+    def test_unbalanced_bucket_split_places_every_layer(self, full_kv_heads):
+        """Sliding-window layers that share a window can differ in page size
+        and count: three 8 KiB pages and two 4 KiB pages here. However far the
+        full page lets the cap split that bucket, every layer keeps a KV
+        tensor."""
+        config = _shared_layout_config()
+
+        def spec(kv_heads: int) -> AttentionSpec:
+            return AttentionSpec(
+                block_size=16,
+                num_kv_heads=kv_heads,
+                head_size=64,
+                dtype=torch.bfloat16,
+            )
+
+        specs = {"full": full_layer(spec(full_kv_heads))}
+        for i, kv_heads in enumerate((2, 2, 2, 1, 1)):
+            specs[f"swa.{i}"] = sliding_window_layer(spec(kv_heads), sliding_window=128)
+        groups = get_kv_cache_groups(config, specs)
+        kv_cache_config = get_kv_cache_config_from_groups(config, groups, MEMORY)
+        placed = [n for t in kv_cache_config.kv_cache_tensors for n in t.layers]
+        assert sorted(placed) == sorted(specs)
+
 
 class TestDensePacking:
     def test_bytes_per_block_is_largest_group(self):
