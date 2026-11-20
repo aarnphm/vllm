@@ -14,6 +14,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     MambaManager,
     SlidingWindowManager,
+    first_request_block_id,
 )
 from vllm.v1.kv_cache_interface import KVCacheGroup, KVCacheSpec
 
@@ -81,8 +82,9 @@ def build_batch(
     """Allocate disjoint blocks and build `NewRequestData` for every request.
 
     Groups share one block pool, so block IDs are unique across groups. Block
-    0 is the null block. Lookahead reserves space for the drafter's KV writes.
-    Every request uses `sampling_params` (default: `SamplingParams()`).
+    0 is the null block, and static sink blocks follow it. Lookahead reserves
+    space for the drafter's KV writes. Every request uses `sampling_params`
+    (default: `SamplingParams()`).
 
     With prefix P = K - Q (KV length K, query length Q):
 
@@ -104,7 +106,7 @@ def build_batch(
     if sampling_params is None:
         sampling_params = SamplingParams()
     expected: dict[str, tuple[int, int, bool]] = {}
-    cursor = 1
+    cursor = first_request_block_id(kv_cache_groups)
     new_reqs = []
     query_token_ids = {}
     group_block_ranges: list[list[tuple[int, int]]] = [[] for _ in kv_cache_groups]

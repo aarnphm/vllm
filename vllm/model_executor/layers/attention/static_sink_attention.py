@@ -5,26 +5,16 @@ import functools
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
-from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import (
-    LayerNameType,
-    _encode_layer_name,
-    _resolve_layer_name,
-    direct_register_custom_op,
-)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
-    subclass_attention_backend,
-)
-from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-    triton_reshape_and_cache_flash_diffkv,
+    subclass_attention_backend_with_overrides,
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.single_type_kv_cache_manager import SinkFullAttentionManager
@@ -103,10 +93,50 @@ def create_static_sink_attention_backend(
 
             return super().build(common_prefix_len, common_attn_metadata, fast_build)
 
-    attn_backend = subclass_attention_backend(
+    # The sink write rides on the KV update op, which attention depends on.
+    assert not underlying_attn_backend.forward_includes_kv_cache_update
+    underlying_impl = underlying_attn_backend.get_impl_cls()
+
+    class StaticSinkAttentionImpl(underlying_impl):  # type: ignore
+        def write_sink(
+            self, layer: "StaticSinkAttention", kv_cache: torch.Tensor
+        ) -> None:
+            """Write the sink KV into blocks 1..sink_len // block_size, which no
+            request owns, with the backend's own KV cache writer."""
+            assert layer.sink_key is not None and layer.sink_value is not None
+            slot_mapping = torch.arange(
+                layer.block_size,
+                layer.block_size + sink_len,
+                device=kv_cache.device,
+                dtype=torch.long,
+            )
+            super().do_kv_cache_update(
+                layer, layer.sink_key, layer.sink_value, kv_cache, slot_mapping
+            )
+
+        def do_kv_cache_update(
+            self,
+            layer: torch.nn.Module,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            kv_cache: torch.Tensor,
+            slot_mapping: torch.Tensor,
+        ) -> None:
+            # Rewrite the sink with every KV update, so it is in place before
+            # this step's attention even if the cache was remapped or the
+            # weights reloaded since the last step.
+            assert isinstance(layer, StaticSinkAttention)
+            if kv_cache.numel() > 0:
+                self.write_sink(layer, kv_cache)
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
+    attn_backend = subclass_attention_backend_with_overrides(
         name_prefix=prefix,
         attention_backend_cls=underlying_attn_backend,
-        builder_cls=StaticSinkAttentionBuilder,
+        overrides={
+            "get_builder_cls": staticmethod(lambda: StaticSinkAttentionBuilder),
+            "get_impl_cls": staticmethod(lambda: StaticSinkAttentionImpl),
+        },
     )
 
     return attn_backend
@@ -151,9 +181,8 @@ class StaticSinkAttention(Attention, CustomOp):
             **kwargs,
         )
         self.sink_len = sink_len
-        self.sink_populated = False
-        self.sink_key = None
-        self.sink_value = None
+        self.sink_key: torch.Tensor | None = None
+        self.sink_value: torch.Tensor | None = None
 
     def update_sink_kv(self, sink_key, sink_value) -> None:
         self.sink_key = sink_key
@@ -169,12 +198,6 @@ class StaticSinkAttention(Attention, CustomOp):
         assert self.sink_key is not None and self.sink_value is not None, (
             "sink_key and sink_value have not been prepared"
         )
-        if not self.sink_populated:
-            self_kv_cache = self.kv_cache
-            torch.ops.vllm.maybe_populate_sink(
-                self_kv_cache, _encode_layer_name(self.layer_name)
-            )
-
         return super().forward(query, key, value, output_shape)
 
     def forward_cuda(
@@ -188,25 +211,6 @@ class StaticSinkAttention(Attention, CustomOp):
 
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
-
-    def populate_sink_kv(self, self_kv_cache):
-        sink_kv_slot_mapping = torch.arange(
-            self.block_size,
-            self.sink_len + self.block_size,
-            device=torch.accelerator.current_device_index(),
-            dtype=torch.long,
-        )
-        triton_reshape_and_cache_flash_diffkv(
-            self.sink_key,
-            self.sink_value,
-            self_kv_cache,
-            sink_kv_slot_mapping,
-            self.kv_cache_dtype,
-            self._k_scale,
-            self._v_scale,
-        )
-        # We only populate the sink_key and sink_value once
-        self.sink_populated = True
 
     def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         # Block size may get updated after model loading, refresh it
@@ -223,22 +227,3 @@ class StaticSinkAttention(Attention, CustomOp):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
         return SinkFullAttentionManager.layer_config(spec, sink_len=self.sink_len)
-
-
-def maybe_populate_sink(
-    self_kv_cache: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    layer_name = _resolve_layer_name(layer_name)
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    if self.sink_populated or self_kv_cache.numel() == 0:
-        return
-    self.populate_sink_kv(self_kv_cache)
-
-
-direct_register_custom_op(
-    op_name="maybe_populate_sink",
-    op_func=maybe_populate_sink,
-    mutates_args=["self_kv_cache"],
-)

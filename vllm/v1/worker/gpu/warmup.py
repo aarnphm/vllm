@@ -24,7 +24,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     CrossAttentionManager,
     MambaManager,
-    SinkFullAttentionManager,
+    first_request_block_id,
 )
 from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.request import Request
@@ -109,19 +109,6 @@ def _warmup_block_counter(
         )
 
     return block_count
-
-
-def _first_block_id(model_runner: GPUModelRunner) -> int:
-    """The first block id warmup requests may take. Block 0 is the null block,
-    and static sinks keep the blocks after it for the engine's lifetime."""
-    first_block_id = 1
-    for group in model_runner.kv_cache_config.kv_cache_groups:
-        if issubclass(group.manager_cls, SinkFullAttentionManager):
-            sink_block_ids = SinkFullAttentionManager.sink_block_ids(
-                group.manager_config, group.block_size
-            )
-            first_block_id = max(first_block_id, sink_block_ids.stop)
-    return first_block_id
 
 
 def _cap_num_warmup_reqs(
@@ -261,7 +248,7 @@ def run_mixed_prefill_decode_warmup(
         for prefill_len in prefill_lens
     ]
     required_blocks = sum(decode_block_counts) + sum(map(sum, prefill_block_counts))
-    first_block_id = _first_block_id(model_runner)
+    first_block_id = first_request_block_id(kv_cache_groups)
     num_blocks = num_committable_kv_blocks(model_runner) - first_block_id
     # Drop extra prefill requests the committable blocks cannot hold.
     while num_blocks < required_blocks and len(prefill_lens) > 1:
@@ -411,7 +398,7 @@ def run_context_prefill_warmup(
     block_count = _warmup_block_counter(model_runner)
     block_counts = [block_count(context_len + query_len, g) for g in kv_cache_groups]
     blocks_per_req = max(sum(block_counts), 1)
-    first_block_id = _first_block_id(model_runner)
+    first_block_id = first_request_block_id(kv_cache_groups)
     num_reqs = min(
         cdiv(num_context_tokens, context_len),
         _cap_num_warmup_reqs(model_runner, model_runner.max_num_reqs, query_len),
@@ -643,7 +630,7 @@ def _warmup_kernels(
     null_blocks = block_tables is not None and (
         block_tables.redirect_writes_to_null_block
     )
-    first_block_id = _first_block_id(model_runner)
+    first_block_id = first_request_block_id(kv_cache_groups)
     if max_blocks_per_req > 0 and not null_blocks:
         # Reserve block 0 (null block) and the static sink blocks, and ensure
         # we have enough blocks.

@@ -30,6 +30,7 @@ from vllm.utils.vmm_driver import (
     MEM_HANDLE_TYPE_FABRIC,
     MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
 )
+from vllm.v1.core.single_type_kv_cache_manager import first_request_block_id
 from vllm.v1.hisparse.binding import rebind_hisparse_device_caches
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -106,6 +107,9 @@ class ExtensibleKVCache:
         if self.capacity_blocks <= 0:
             raise ValueError(f"Invalid KV cache capacity {self.capacity_blocks}.")
         self._is_block_outermost = layout.is_block_outermost
+        self._first_request_block_id = first_request_block_id(
+            kv_cache_config.kv_cache_groups
+        )
         self.segment_offsets, self.segment_strides = self._segments(tensors, layout)
         self.bytes_per_block = sum(self.segment_strides)
         self.num_committed_blocks = 0
@@ -182,9 +186,10 @@ class ExtensibleKVCache:
 
     @property
     def min_committed_blocks(self) -> int:
-        """The null block, plus one under block-outermost layouts, whose views
-        start inside block 0 and read past it (see `pad_kv_cache_segments`)."""
-        return 2 if self._is_block_outermost else 1
+        """The null block and any static sink blocks, which every step reads,
+        plus one under block-outermost layouts, whose views start inside block 0
+        and read past it (see `pad_kv_cache_segments`)."""
+        return max(2 if self._is_block_outermost else 1, self._first_request_block_id)
 
     def allocate(self, size: int) -> torch.Tensor:
         """Allocator hook for allocate_kv_cache; commits the minimum."""
