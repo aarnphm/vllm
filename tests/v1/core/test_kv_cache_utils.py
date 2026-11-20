@@ -26,6 +26,7 @@ from tests.v1.core.utils import (
 )
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     KVTransferConfig,
     ModelConfig,
     ParallelConfig,
@@ -49,6 +50,7 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_planning import (
     _pool_bytes_per_block,
+    check_enough_kv_cache_memory,
     get_kv_cache_groups,
 )
 from vllm.v1.core.kv_cache_utils import (
@@ -1904,6 +1906,23 @@ def test_generate_scheduler_kv_cache_config_keeps_zeroing(
     assert configs[0].needs_kv_cache_zeroing is needs_zeroing
     assert configs[1].needs_kv_cache_zeroing is needs_zeroing
     assert scheduler_config.needs_kv_cache_zeroing is needs_zeroing
+
+
+def test_capacity_check_holds_back_static_sink_blocks():
+    """The block pool never hands out the null block or a static sink's blocks,
+    so startup must fit `max_model_len` into the blocks left after them."""
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=64),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    config.cache_config.kv_cache_layout = "LBNHC"
+    spec = new_kv_cache_spec(block_size=16)
+    sink = {"layer": SinkFullAttentionManager.layer_config(spec, sink_len=32)}
+
+    # 64 tokens take 4 blocks, after the null block and 2 sink blocks.
+    with pytest.raises(ValueError, match="max seq len"):
+        check_enough_kv_cache_memory(config, sink, 6 * spec.page_size_bytes)
+    check_enough_kv_cache_memory(config, sink, 7 * spec.page_size_bytes)
 
 
 def test_resolve_dcp_kv_block_size_scales_only_sharded_groups():

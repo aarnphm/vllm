@@ -28,6 +28,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     MambaManager,
     SlidingWindowManager,
+    first_request_block_id,
 )
 from vllm.v1.hisparse.layout import (
     get_hisparse_host_pool_bytes,
@@ -211,12 +212,15 @@ def check_enough_kv_cache_memory(
     """
     # No need to check for available memory if there are no KV cache layers
     if layer_configs:
-        # Reserve the null block BlockPool permanently holds back, so the check
-        # plans against usable blocks, as in get_kv_cache_configs. Group a copy
-        # of the specs since grouping may unify them in-place.
+        # Reserve the blocks BlockPool permanently holds back (the null block
+        # and any static sink blocks), so the check plans against usable
+        # blocks, as in get_kv_cache_configs. Group a copy of the specs since
+        # grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(layer_configs))
         check_memory = (
-            available_memory - _pool_bytes_per_block(vllm_config, groups)
+            available_memory
+            - first_request_block_id(groups)
+            * _pool_bytes_per_block(vllm_config, groups)
             if groups
             else available_memory
         )
@@ -1524,12 +1528,14 @@ def get_kv_cache_configs(
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
-    # Reserve the null block BlockPool permanently holds back, so auto-fit and
-    # the capacity check both plan against usable blocks. Allocation below
-    # still uses the full memory.
+    # Reserve the blocks BlockPool permanently holds back (the null block and
+    # any static sink blocks), so auto-fit and the capacity check both plan
+    # against usable blocks. Allocation below still uses the full memory.
     check_memory = [
         (
-            avail_mem - _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            avail_mem
+            - first_request_block_id(groups)
+            * _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
             if groups
             else avail_mem
         )
@@ -1755,10 +1761,10 @@ def shrink_kv_cache_configs(
         ]
         groups = kv_cache_config.kv_cache_groups
         if groups:
-            # The null block is held back by the BlockPool, as in the capacity
-            # check of `get_kv_cache_configs`.
+            # The null block and any static sink blocks are held back by the
+            # BlockPool, as in the capacity check of `get_kv_cache_configs`.
             _check_enough_kv_cache_memory(
-                (num_blocks - 1)
+                (num_blocks - first_request_block_id(groups))
                 * _pool_bytes_per_block_from_builder(builder, vllm_config, groups),
                 partial(
                     _max_memory_usage_bytes_from_groups, builder, vllm_config, groups

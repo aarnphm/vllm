@@ -3782,6 +3782,58 @@ def test_static_sink_blocks_are_never_allocated():
         assert manager.reset_prefix_cache()
 
 
+def test_static_sink_layers_in_several_groups_are_refused():
+    """Every `StaticSinkAttention` layer keeps its sink KV in the same block ids
+    and KV cache groups alias the same bytes, so two sink groups would write
+    over each other's sink. Startup must refuse them."""
+    block_size = 16
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    sink = SinkFullAttentionManager.layer_config(spec, sink_len=2 * block_size)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=11,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group(["layer.0"], sink),
+            new_kv_cache_group(["layer.1"], sink),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="single KV cache group"):
+        make_kv_cache_manager(
+            kv_cache_config,
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=block_size,
+        )
+
+
+def test_static_sink_layers_refuse_decode_context_parallelism():
+    """Each DCP rank keeps the whole sink in its blocks 1..sink_len/block_size,
+    which DCP-scaled scheduler blocks would not reserve. Startup must refuse."""
+    block_size = 16
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    sink = SinkFullAttentionManager.layer_config(spec, sink_len=4 * block_size)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=11,
+        kv_cache_tensors=[],
+        kv_cache_groups=[new_kv_cache_group(["layer"], sink)],
+    )
+
+    with pytest.raises(ValueError, match="decode context parallelism"):
+        make_kv_cache_manager(
+            kv_cache_config,
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=2 * block_size,
+            scheduler_block_size=2 * block_size,
+            dcp_world_size=2,
+        )
+
+
 def test_prefix_cache_stats_disabled():
     """Test that prefix_cache_stats is None when log_stats is False."""
     block_size = 16
