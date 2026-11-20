@@ -32,8 +32,16 @@ from tests.v1.core.utils import (
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.attention import HiSparseConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.model_executor.layers.attention.static_sink_attention import (
+    create_static_sink_attention_backend,
+)
 from vllm.models.kimi_k3.common.dsa_cache import SelfAddressedMLASpec
-from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    MultipleOf,
+)
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -451,6 +459,71 @@ def test_no_attn_metadata_layers_keep_their_layout_without_builders(monkeypatch)
         kv_cache_config=kv_cache_config,
     )
     assert attn_metadata == {"target": "Target"}
+
+
+def test_static_sink_builder_keeps_batch_seq_lens():
+    """The sink lengths reach only the sink group's builder. The batch seq_lens
+    stays as it was: the sampler's chunked-prefill check, the drafters and later
+    KV cache groups read it after this build."""
+    sink_len = 16
+    received: dict[str, tuple[list[int], int]] = {}
+
+    class RecordingBuilder(AttentionMetadataBuilder):
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            received[self.layer_names[0]] = (
+                common_attn_metadata.seq_lens.tolist(),
+                common_attn_metadata.max_seq_len,
+            )
+
+    class RecordingBackend:
+        @staticmethod
+        def get_builder_cls():
+            return RecordingBuilder
+
+    backend: Any = RecordingBackend
+    sink_backend = create_static_sink_attention_backend(backend, sink_len=sink_len)
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=256))
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.cache_config.block_size = 16
+    spec = new_kv_cache_spec(block_size=16)
+    attn_groups = [
+        [AttentionGroup(sink_backend, ["sink"], spec, 0)],
+        [AttentionGroup(backend, ["full"], spec, 1)],
+    ]
+    for (group,) in attn_groups:
+        group.create_metadata_builders(vllm_config, torch.device("cpu"))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group(["sink"], spec),
+            new_kv_cache_group(["full"], spec),
+        ],
+    )
+    # A decode, a prefill chunk that ends 10 tokens short of its prompt, and a
+    # padded request.
+    seq_lens = torch.tensor([37, 100, 0], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 51, 51], dtype=torch.int32)
+    attn_utils.build_attn_metadata(
+        attn_groups,
+        num_reqs=3,
+        num_tokens=51,
+        query_start_loc_gpu=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        max_query_len=50,
+        seq_lens=seq_lens,
+        max_seq_len=100,
+        block_tables=[torch.zeros(3, 16, dtype=torch.int32)] * 2,
+        slot_mappings=torch.zeros(2, 51, dtype=torch.int64),
+        kv_cache_config=kv_cache_config,
+    )
+
+    assert seq_lens.tolist() == [37, 100, 0]
+    assert received["sink"] == ([37 + sink_len, 100 + sink_len, 0], 100 + sink_len)
+    assert received["full"] == ([37, 100, 0], 100)
 
 
 def test_varlen_cudagraph_unsupported_backend_checks_scoped_bounds():
