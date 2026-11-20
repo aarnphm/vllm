@@ -163,6 +163,8 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        # Blocks held back by `reserve_blocks`.
+        self.reserved_blocks: list[KVCacheBlock] = []
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -678,6 +680,23 @@ class BlockPool:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
+    def reserve_blocks(self, block_ids: Iterable[int]) -> None:
+        """Hold back blocks that layers address by a fixed id for the pool's
+        lifetime. Like the null block, they are never allocated, cached or
+        freed, and KV cache usage excludes them.
+
+        Args:
+            block_ids: The ids of the blocks to hold back; each must be free
+                and uncached.
+
+        """
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            assert block.block_hash is None, f"Cannot reserve cached block {block_id}"
+            # Raises if a request or another reservation holds the block.
+            self.free_block_queue.remove(block)
+            self.reserved_blocks.append(block)
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -869,11 +888,13 @@ class BlockPool:
 
         """
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
-        if num_used_blocks != 1:  # The null block is always marked as used
+        # The null block and reserved blocks are always marked as used.
+        num_held_blocks = 1 + len(self.reserved_blocks)
+        if num_used_blocks != num_held_blocks:
             logger.warning(
                 "Failed to reset prefix cache because some "
                 "blocks (%d) are not freed yet",
-                num_used_blocks - 1,
+                num_used_blocks - num_held_blocks,
             )
             return False
 
@@ -916,8 +937,8 @@ class BlockPool:
             The KV cache usage (between 0.0 and 1.0).
 
         """
-        # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        # Subtract the null block and reserved blocks.
+        total_gpu_blocks = self.num_gpu_blocks - 1 - len(self.reserved_blocks)
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

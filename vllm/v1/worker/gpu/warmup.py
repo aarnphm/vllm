@@ -24,6 +24,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     CrossAttentionManager,
     MambaManager,
+    SinkFullAttentionManager,
 )
 from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.request import Request
@@ -108,6 +109,19 @@ def _warmup_block_counter(
         )
 
     return block_count
+
+
+def _first_block_id(model_runner: GPUModelRunner) -> int:
+    """The first block id warmup requests may take. Block 0 is the null block,
+    and static sinks keep the blocks after it for the engine's lifetime."""
+    first_block_id = 1
+    for group in model_runner.kv_cache_config.kv_cache_groups:
+        if issubclass(group.manager_cls, SinkFullAttentionManager):
+            sink_block_ids = SinkFullAttentionManager.sink_block_ids(
+                group.manager_config, group.block_size
+            )
+            first_block_id = max(first_block_id, sink_block_ids.stop)
+    return first_block_id
 
 
 def _cap_num_warmup_reqs(
@@ -247,16 +261,17 @@ def run_mixed_prefill_decode_warmup(
         for prefill_len in prefill_lens
     ]
     required_blocks = sum(decode_block_counts) + sum(map(sum, prefill_block_counts))
-    num_blocks = num_committable_kv_blocks(model_runner)
+    first_block_id = _first_block_id(model_runner)
+    num_blocks = num_committable_kv_blocks(model_runner) - first_block_id
     # Drop extra prefill requests the committable blocks cannot hold.
-    while num_blocks <= required_blocks and len(prefill_lens) > 1:
+    while num_blocks < required_blocks and len(prefill_lens) > 1:
         prefill_lens.pop()
         required_blocks -= sum(prefill_block_counts.pop())
     num_tokens = decode_scheduled_tokens + sum(prefill_lens)
     prefill_req_ids = [
         f"{req_id_prefix}_prefill_{i}_" for i in range(len(prefill_lens))
     ]
-    if num_blocks <= required_blocks:
+    if num_blocks < required_blocks:
         logger.warning(
             "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
             "are available for %d required warmup blocks.",
@@ -264,9 +279,9 @@ def run_mixed_prefill_decode_warmup(
             required_blocks,
         )
         return False
-    ensure_kv_cache_blocks(model_runner, 1 + required_blocks)
+    ensure_kv_cache_blocks(model_runner, first_block_id + required_blocks)
 
-    next_block_id = 1
+    next_block_id = first_block_id
 
     def _alloc_blocks(num_blocks: int) -> list[int]:
         nonlocal next_block_id
@@ -396,16 +411,17 @@ def run_context_prefill_warmup(
     block_count = _warmup_block_counter(model_runner)
     block_counts = [block_count(context_len + query_len, g) for g in kv_cache_groups]
     blocks_per_req = max(sum(block_counts), 1)
+    first_block_id = _first_block_id(model_runner)
     num_reqs = min(
         cdiv(num_context_tokens, context_len),
         _cap_num_warmup_reqs(model_runner, model_runner.max_num_reqs, query_len),
-        (num_committable_kv_blocks(model_runner) - 1) // blocks_per_req,
+        (num_committable_kv_blocks(model_runner) - first_block_id) // blocks_per_req,
     )
     if num_reqs < 1:
         return False
-    ensure_kv_cache_blocks(model_runner, 1 + num_reqs * blocks_per_req)
+    ensure_kv_cache_blocks(model_runner, first_block_id + num_reqs * blocks_per_req)
 
-    next_block_id = 1
+    next_block_id = first_block_id
 
     def _alloc_blocks(num_blocks: int) -> list[int]:
         nonlocal next_block_id
@@ -627,14 +643,16 @@ def _warmup_kernels(
     null_blocks = block_tables is not None and (
         block_tables.redirect_writes_to_null_block
     )
+    first_block_id = _first_block_id(model_runner)
     if max_blocks_per_req > 0 and not null_blocks:
-        # Reserve block 0 (null block) and ensure we have enough blocks.
+        # Reserve block 0 (null block) and the static sink blocks, and ensure
+        # we have enough blocks.
         # Encoder-only models allocate no KV blocks, so this cap doesn't apply.
-        num_reqs = min(
-            num_reqs,
-            max(1, (num_committable_kv_blocks(model_runner) - 1) // max_blocks_per_req),
+        num_free_blocks = num_committable_kv_blocks(model_runner) - first_block_id
+        num_reqs = min(num_reqs, max(1, num_free_blocks // max_blocks_per_req))
+        ensure_kv_cache_blocks(
+            model_runner, first_block_id + num_reqs * max_blocks_per_req
         )
-        ensure_kv_cache_blocks(model_runner, 1 + num_reqs * max_blocks_per_req)
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
@@ -654,8 +672,9 @@ def _warmup_kernels(
         )
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
+    # Assign distinct block IDs per request per group, after the null block and
+    # the static sink blocks.
+    next_block_id = first_block_id
 
     def _alloc_blocks(num_blocks: int) -> list[int]:
         nonlocal next_block_id
