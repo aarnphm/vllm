@@ -1793,6 +1793,7 @@ def test_csa_linear_selects_compressed_sparse_compressor_state_and_mamba_regions
 @pytest.mark.cpu_test
 def test_csa_linear_ple_descriptor_is_not_split():
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        HeadWindow,
         TPMapping,
     )
 
@@ -1809,8 +1810,8 @@ def test_csa_linear_ple_descriptor_is_not_split():
     mapping = TPMapping(
         source_ranks_per_group=((0,), (0,), (0, 1), (0, 1)),
         all_source_ranks=(0, 1),
-        rank_to_attention_slot={0: 0, 1: 0},
-        rank_offset_factor=0,
+        head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
+        local_heads=1,
     )
     splits = list(
         worker._build_local_splits_from_plan(

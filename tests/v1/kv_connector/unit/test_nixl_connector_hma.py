@@ -52,7 +52,10 @@ from .utils import (
 @pytest.fixture
 def region_pull_worker():
     """Real page mapping and descriptors, with only the transport mocked."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        HeadWindow,
+        TPMapping,
+    )
 
     worker = object.__new__(NixlConnectorWorker)
     worker.engine_id = "D"
@@ -108,7 +111,9 @@ def region_pull_worker():
         remote_block_size=64,
         remote_physical_blocks_per_logical=2,
     )
-    worker.tp_mappings = {"P": TPMapping(((0,), (0,)), (0,), {0: 0}, 0)}
+    worker.tp_mappings = {
+        "P": TPMapping(((0,), (0,)), (0,), {0: HeadWindow(0, 0, 1)}, 1)
+    }
     worker._mixed_mem_types = True
     worker.src_xfer_handles_by_block_size = {64: 1}
     worker._dram_src_handles_by_block_size = {64: 2}
@@ -197,7 +202,10 @@ def test_dcp_region_pull(region_pull_worker, num_pages, region_groups):
         RemoteMeta,
         ReqMeta,
     )
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        HeadWindow,
+        TPMapping,
+    )
 
     worker = region_pull_worker
     worker.region_group_ids = list(region_groups)
@@ -218,7 +226,9 @@ def test_dcp_region_pull(region_pull_worker, num_pages, region_groups):
     remote = worker.transfer_topo.get_engine_info.return_value
     remote.remote_tp_size = remote.remote_dcp_size = 8
     remote.remote_physical_blocks_per_logical = 1
-    worker.tp_mappings["P"] = TPMapping((ranks, ranks), ranks, {r: r for r in ranks}, 8)
+    worker.tp_mappings["P"] = TPMapping(
+        (ranks, ranks), ranks, {r: HeadWindow(0, 0, 1) for r in ranks}, 1
+    )
     worker._remote_agents = {"P": {(0, r): f"P-rank{r}" for r in ranks}}
     # Two regions with different prefix hits, plus one padding page each.
     local = (
@@ -307,7 +317,10 @@ def test_dcp_pull_reads_replicated_draft_group_from_one_rank(
         RemoteMeta,
         ReqMeta,
     )
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        HeadWindow,
+        TPMapping,
+    )
 
     worker = region_pull_worker
     worker.tp_rank = tp_rank
@@ -317,7 +330,9 @@ def test_dcp_pull_reads_replicated_draft_group_from_one_rank(
     remote.remote_tp_size = remote.remote_dcp_size = 4
     remote.remote_physical_blocks_per_logical = 1
     ranks = tuple(range(4))
-    worker.tp_mappings["P"] = TPMapping((ranks, ranks), ranks, {r: r for r in ranks}, 0)
+    worker.tp_mappings["P"] = TPMapping(
+        (ranks, ranks), ranks, {r: HeadWindow(0, 0, 1) for r in ranks}, 1
+    )
     worker._remote_stages["P"] = remote_stage(
         region_pairs_by_index(2, groups=[0, 1]),
         region_num_blocks=[100, 100],
@@ -2452,6 +2467,7 @@ def test_push_write_hybrid_mla_replicates_attention():
         NixlPushConnectorWorker,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        HeadWindow,
         TPMapping,
     )
     from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
@@ -2476,8 +2492,8 @@ def test_push_write_hybrid_mla_replicates_attention():
         engine_id: TPMapping(
             source_ranks_per_group=((0,), (0, 1)),
             all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 0},
-            rank_offset_factor=0,
+            head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
+            local_heads=1,
         )
     }
     worker.src_xfer_handles_by_tp_ratio = {(-2, 4): [200, 201]}

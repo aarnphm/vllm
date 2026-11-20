@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    HeadWindow,
     TPMapping,
     _is_attention_spec,
     _is_ssm_spec,
@@ -324,9 +325,8 @@ class NixlBaseConnectorWorker:
         """Build split handle data for P_TP > D_TP scenario.
 
         num_fa_descs is the boundary between FA and SSM descriptors.
-        Split counts are derived from source_ranks_per_group lengths.
-        FA uses rank_to_attention_slot for the slot offset;
-        SSM uses the rank's positional index.
+        FA takes each source rank's head window (`plan.head_windows`);
+        SSM splits by the rank's positional index.
         Each Nx5 strided desc covers one region, so slicing it slices every block.
         """
         fa_idx = next(
@@ -367,10 +367,11 @@ class NixlBaseConnectorWorker:
         ssm_split = ~is_fa & (starts < sharded_desc_end)
 
         for p_idx, p_rank in enumerate(plan.all_source_ranks):
-            fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
+            window = plan.head_windows[p_rank]
             handle = src_blocks_data.copy()
-            handle[fa_split, 1] //= fa_num_splits
-            handle[fa_split, 0] += fa_slot * handle[fa_split, 1]
+            block_len = handle[fa_split, 1]
+            handle[fa_split, 0] += block_len * window.local // plan.local_heads
+            handle[fa_split, 1] = block_len * window.count // plan.local_heads
             if ssm_num_splits:
                 handle[ssm_split, 1] //= ssm_num_splits
                 handle[ssm_split, 0] += p_idx * handle[ssm_split, 1]
@@ -2370,20 +2371,19 @@ class NixlBaseConnectorWorker:
         plan: TPMapping,
         nixl_agent_meta: NixlAgentMetadata,
         block_size_ratio: int,
+        remote_tp_rank: int,
         local_region_ids: Sequence[int] | None = None,
     ) -> np.ndarray:
         """Build remote FA descriptors as Nx5 uint64 strided descs.
 
-        `local_region_ids` gives a local region each remote region pairs with
-        (`_RegionPairs.partner`); remote region `i` pairs with local region
-        `i` without it.
+        Each region reads this rank's head window from remote rank
+        `remote_tp_rank`. `local_region_ids` gives a local region each remote
+        region pairs with (`_RegionPairs.partner`); remote region `i` pairs
+        with local region `i` without it.
         """
         assert self.transfer_topo is not None
         assert nixl_agent_meta.kv_caches_base_addr, (
             "Remote KV cache base addresses must not be empty."
-        )
-        fa_group_idx = next(
-            i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
         )
         region_num_blocks = nixl_agent_meta.region_num_blocks or [
             nixl_agent_meta.num_blocks
@@ -2394,32 +2394,27 @@ class NixlBaseConnectorWorker:
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             local_region = local_region_ids[i] if local_region_ids else i
             replicated = self._is_region_replicated(local_region)
-            # Read our whole local region size from remote..
-            local_block_len = self.block_len_per_layer[local_region]
-            remote_kv_block_len = local_block_len // block_size_ratio
-            if block_size_ratio > 1:
-                # ..using remote kv_block_len as transfer unit
-                local_block_len = remote_kv_block_len
+            # Our local block at the remote block size is the transfer unit.
+            block_len = self.block_len_per_layer[local_region] // block_size_ratio
 
-            # REPLICATE reads the whole block once at offset 0; SPLIT gathers
-            # its head slice from each source rank at a per-rank offset.
+            # REPLICATE reads the whole block at offset 0; SPLIT reads the
+            # heads this rank shares with the remote rank. Blocks are
+            # head-major, so heads [a, a + n) of H span bytes
+            # [len * a / H, len * (a + n) / H) on both sides.
             if replicated:
-                num_reads, rank_offset = 1, 0
+                window, local_heads = HeadWindow(0, 0, 1), 1
             else:
                 region_plan = (
                     self.draft_tp_mappings[nixl_agent_meta.engine_id]
                     if local_region in self._head_sharded_draft_regions
                     else plan
                 )
-                num_reads = len(region_plan.source_ranks_per_group[fa_group_idx])
-                rank_offset = region_plan.rank_offset_factor * remote_kv_block_len
-            local_block_len = local_block_len // num_reads
-
-            addr = base_addr + rank_offset
+                window = region_plan.head_windows[remote_tp_rank]
+                local_heads = region_plan.local_heads
+            addr = base_addr + block_len * window.remote // local_heads
+            length = block_len * window.count // local_heads
             count = region_num_blocks[i]
-            strided_descs.append(
-                (addr, local_block_len, device_id, block_strides[i], count)
-            )
+            strided_descs.append((addr, length, device_id, block_strides[i], count))
         return self._pack_strided_descs(strided_descs)
 
     def register_local_xfer_handler(
@@ -2795,6 +2790,7 @@ class NixlBaseConnectorWorker:
             plan,
             nixl_agent_meta,
             block_size_ratio,
+            remote_tp_rank,
             pairs.partner,
         )
         logger.debug(

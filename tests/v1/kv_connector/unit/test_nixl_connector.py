@@ -60,6 +60,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import HeadWindow
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
@@ -1330,10 +1331,9 @@ class TestNixlHandshake:
             attn_backends=worker.attn_backends,
             tensor_shape=None,
         )
-        plan = MagicMock(
-            source_ranks_per_group=((0,), (0,)),
-            rank_offset_factor=1,
-        )
+        # Rank 1 of 2 holds head 1; P TP1 holds heads 0-1, so the head sits
+        # one head into the remote block.
+        plan = MagicMock(head_windows={0: HeadWindow(0, 1, 1)}, local_heads=1)
         meta = NixlAgentMetadata(
             engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             agent_metadata=FakeNixlWrapper.AGENT_METADATA,
@@ -1350,7 +1350,9 @@ class TestNixlHandshake:
             region_num_blocks=None,
         )
 
-        assert worker._build_fa_remote(plan, meta, block_size_ratio=1).tolist() == [
+        assert worker._build_fa_remote(
+            plan, meta, block_size_ratio=1, remote_tp_rank=0
+        ).tolist() == [
             [0x1000 + local_block_len, local_block_len, 0, remote_block_len, 1]
         ]
 
@@ -1599,10 +1601,15 @@ class TestNixlHandshake:
         worker, meta, mla_len, draft_len = self._mla_target_with_gqa_draft(
             tp_size=8, tp_rank=tp_rank, remote_tp_size=remote_tp_size
         )
-        worker.add_remote_agent(meta, remote_tp_size=remote_tp_size)
+        source = tp_rank * remote_tp_size // 8  # the prefill rank holding our head
+        worker.add_remote_agent(
+            meta, remote_tp_rank=source, remote_tp_size=remote_tp_size
+        )
 
         plan = worker.tp_mappings[FakeNixlConnectorWorker.REMOTE_ENGINE_ID]
-        remote = worker._build_fa_remote(plan, meta, block_size_ratio=1)
+        remote = worker._build_fa_remote(
+            plan, meta, block_size_ratio=1, remote_tp_rank=source
+        )
         assert expand_strided_descs(remote).tolist() == [
             [0x10000, mla_len, 0],
             [0x20000 + draft_slice * draft_len, draft_len, 0],
@@ -1640,7 +1647,9 @@ class TestNixlHandshake:
 
         plan = worker.tp_mappings[FakeNixlConnectorWorker.REMOTE_ENGINE_ID]
         pages = [remote_page_base + b * remote_page for b in range(num_blocks)]
-        remote = worker._build_fa_remote(plan, meta, block_size_ratio=1)
+        remote = worker._build_fa_remote(
+            plan, meta, block_size_ratio=1, remote_tp_rank=0
+        )
         assert expand_strided_descs(remote).tolist() == [
             *([page, mla_len, 0] for page in pages),
             *([page + mla_len + tp_rank * draft_len, draft_len, 0] for page in pages),

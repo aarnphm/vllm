@@ -6,8 +6,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,
@@ -38,6 +36,21 @@ def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadWindow:
+    """The KV heads a local rank reads from one remote rank.
+
+    `local` and `remote` index the first shared head within each rank's own
+    head slice; `count` heads follow. In a head-major block of `local_heads`
+    heads the window is the byte range [len * local, len * (local + count))
+    / local_heads, and the same fraction of a remote block of equal length.
+    """
+
+    local: int
+    remote: int
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
 class TPMapping:
     """Complete local-to-remote TP mapping for one remote engine.
 
@@ -51,11 +64,11 @@ class TPMapping:
     # Superset of all source ranks (union of all groups).
     all_source_ranks: tuple[int, ...]
 
-    # Maps each source rank to its FA head slot index.
-    rank_to_attention_slot: dict[int, int]
+    # Per source rank, the attention KV heads this rank reads from it.
+    head_windows: dict[int, HeadWindow]
 
-    # FA head offset factor for hetero-TP (D_TP > P_TP).
-    rank_offset_factor: int
+    # Attention KV heads this rank holds (1 for a replicated MLA latent).
+    local_heads: int
 
     # Local ranks (in aggregate) that read from a given source rank. The producer frees
     # a request's blocks only once that many notifications have come in.
@@ -67,18 +80,33 @@ class TPMapping:
 # ======================================================================
 
 
-def compute_head_offset(
-    tp_rank: int, tp_size: int, remote_tp_size: int, total_num_kv_heads: int
-) -> int:
-    """Return the offset in local head slices within the remote KV block."""
-    if tp_size <= remote_tp_size:
-        return 0
-    if tp_size > total_num_kv_heads:
-        remote_rank = tp_rank * remote_tp_size // tp_size
-        local_head = tp_rank * total_num_kv_heads // tp_size
-        remote_head = remote_rank * total_num_kv_heads // remote_tp_size
-        return local_head - remote_head
-    return tp_rank % (tp_size // remote_tp_size)
+def head_slice(total_num_kv_heads: int, tp_size: int, tp_rank: int) -> tuple[int, int]:
+    """(first KV head, head count) held by `tp_rank`.
+
+    TP splits the head axis into `tp_size` equal ranges. With more ranks than
+    heads, each rank holds the single head `tp_rank * heads // tp_size`.
+    """
+    if tp_size <= total_num_kv_heads:
+        count = total_num_kv_heads // tp_size
+        return tp_rank * count, count
+    return tp_rank * total_num_kv_heads // tp_size, 1
+
+
+def head_window(
+    total_num_kv_heads: int,
+    tp_size: int,
+    tp_rank: int,
+    remote_tp_size: int,
+    remote_rank: int,
+) -> HeadWindow:
+    """The KV heads two ranks share: the intersection of their head slices."""
+    local_first, local_count = head_slice(total_num_kv_heads, tp_size, tp_rank)
+    remote_first, remote_count = head_slice(
+        total_num_kv_heads, remote_tp_size, remote_rank
+    )
+    first = max(local_first, remote_first)
+    end = min(local_first + local_count, remote_first + remote_count)
+    return HeadWindow(first - local_first, first - remote_first, max(0, end - first))
 
 
 def compute_tp_mapping(
@@ -119,13 +147,14 @@ def compute_tp_mapping(
         # P (remote TP) > D (local TP): one local rank
         # reads from multiple remote ranks.
         # GQA dedup: when K < remote_tp_size, several remote ranks
-        # hold the same KV head.  np.unique keeps only the first
-        # rank per unique head so we don't issue redundant reads.
+        # hold the same KV head. Keep only the first rank per head
+        # so we don't issue redundant reads.
         abs_tp = remote_tp_size // tp_size
-        start = tp_rank * abs_tp
-        heads = np.arange(start, start + abs_tp) * total_num_kv_heads // remote_tp_size
-        _, unique_idx = np.unique(heads, return_index=True)
-        attn_ranks = (start + np.sort(unique_idx)).tolist()
+        first_rank_per_head: dict[int, int] = {}
+        for r in range(tp_rank * abs_tp, (tp_rank + 1) * abs_tp):
+            head = head_slice(total_num_kv_heads, remote_tp_size, r)[0]
+            first_rank_per_head.setdefault(head, r)
+        attn_ranks = sorted(first_rank_per_head.values())
 
     # --- SSM source ranks ---
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
@@ -146,21 +175,17 @@ def compute_tp_mapping(
         for t in group_spec_types
     )
 
-    # --- Attention head slots ---
-    head_to_slot: dict[int, int] = {}
-    for i, r in enumerate(attn_ranks):
-        head_to_slot[r * total_num_kv_heads // remote_tp_size] = i
-    rank_to_attention_slot = {
-        r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
-        for r in all_ranks
-    }
-
-    # --- Rank offset factor ---
-    rank_offset_factor = (
-        0
-        if is_mla
-        else compute_head_offset(tp_rank, tp_size, remote_tp_size, total_num_kv_heads)
-    )
+    # --- Attention head windows ---
+    # MLA's latent is one head replicated on every rank: read it whole.
+    if is_mla:
+        local_heads = 1
+        head_windows = {r: HeadWindow(0, 0, 1) for r in all_ranks}
+    else:
+        local_heads = head_slice(total_num_kv_heads, tp_size, tp_rank)[1]
+        head_windows = {
+            r: head_window(total_num_kv_heads, tp_size, tp_rank, remote_tp_size, r)
+            for r in all_ranks
+        }
 
     local_consumers = transfer_topology.dcp_consumer_count(
         remote_tp_size, remote_dcp_size
@@ -169,7 +194,7 @@ def compute_tp_mapping(
     return TPMapping(
         source_ranks_per_group=source_ranks_per_group,
         all_source_ranks=tuple(all_ranks),
-        rank_to_attention_slot=rank_to_attention_slot,
-        rank_offset_factor=rank_offset_factor,
+        head_windows=head_windows,
+        local_heads=local_heads,
         local_consumers=local_consumers,
     )

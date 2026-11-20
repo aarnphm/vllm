@@ -16,6 +16,7 @@ import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    HeadWindow,
     TPMapping,
     compute_tp_mapping,
 )
@@ -103,9 +104,11 @@ def test_head_sharded_draft_under_mla_target_gets_gqa_offset(
         num_kv_heads=1,
         head_sharded_kv_heads=draft_kv_heads,
     )
-    assert mla.rank_offset_factor == 0
-    assert draft.rank_offset_factor == expected_offset
     assert draft.all_source_ranks == mla.all_source_ranks
+    (source,) = draft.all_source_ranks
+    assert mla.head_windows[source] == HeadWindow(0, 0, 1)
+    assert draft.local_heads == 1
+    assert draft.head_windows[source] == HeadWindow(0, expected_offset, 1)
 
 
 @pytest.mark.parametrize(
@@ -238,8 +241,8 @@ class TestMambaPlanSplitHandles:
         plan = TPMapping(
             source_ranks_per_group=(fa_readers, ssm_readers),
             all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 0},
-            rank_offset_factor=0,
+            head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
+            local_heads=1,
         )
 
         worker = _make_mock_worker_for_splits((AttentionSpec, MambaSpec))
@@ -281,8 +284,8 @@ class TestMambaPlanSplitHandles:
         plan = TPMapping(
             source_ranks_per_group=((0,), (0, 1)),
             all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 0},
-            rank_offset_factor=0,
+            head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
+            local_heads=1,
         )
 
         worker = _make_mock_worker_for_splits((AttentionSpec, MambaSpec))
@@ -310,8 +313,8 @@ class TestMambaPlanSplitHandles:
         plan = TPMapping(
             source_ranks_per_group=((0, 1), (0, 1)),
             all_source_ranks=(0, 1),
-            rank_to_attention_slot={0: 0, 1: 1},
-            rank_offset_factor=0,
+            head_windows={0: HeadWindow(0, 0, 1), 1: HeadWindow(1, 0, 1)},
+            local_heads=2,
         )
 
         worker = _make_mock_worker_for_splits((AttentionSpec, MambaSpec))

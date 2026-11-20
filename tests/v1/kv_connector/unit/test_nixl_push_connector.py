@@ -51,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    HeadWindow,
     ReadSpec,
     TPMapping,
 )
@@ -1579,6 +1580,7 @@ class TestPushWriterMlaReplication:
         from types import SimpleNamespace
 
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+            HeadWindow,
             TPMapping,
         )
 
@@ -1600,8 +1602,8 @@ class TestPushWriterMlaReplication:
             engine_id: TPMapping(
                 source_ranks_per_group=((0,),),
                 all_source_ranks=(0,),
-                rank_to_attention_slot={0: 0},
-                rank_offset_factor=0,
+                head_windows={0: HeadWindow(0, 0, 1)},
+                local_heads=1,
             )
         }
         w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
@@ -1662,6 +1664,7 @@ class TestPushWriterMlaReplication:
             ReqMeta,
         )
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+            HeadWindow,
             TPMapping,
         )
 
@@ -1684,8 +1687,8 @@ class TestPushWriterMlaReplication:
             engine_id: TPMapping(
                 source_ranks_per_group=((0,), (0,), (0, 1), (0, 1)),
                 all_source_ranks=(0, 1),
-                rank_to_attention_slot={0: 0, 1: 0},
-                rank_offset_factor=0,
+                head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
+                local_heads=1,
             )
         }
         w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
@@ -1748,6 +1751,7 @@ class TestPushPrefixCaching:
         from types import SimpleNamespace
 
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+            HeadWindow,
             TPMapping,
         )
 
@@ -1769,8 +1773,8 @@ class TestPushPrefixCaching:
             engine_id: TPMapping(
                 source_ranks_per_group=((0,),),
                 all_source_ranks=(0,),
-                rank_to_attention_slot={0: 0},
-                rank_offset_factor=0,
+                head_windows={0: HeadWindow(0, 0, 1)},
+                local_heads=1,
             )
         }
         w.dst_num_blocks = {engine_id: 10_000, w.engine_id: 10_000}
@@ -2063,14 +2067,18 @@ def test_layer_descriptors_pair_layers_across_asymmetric_pp_split(
     # L3 -> remote region 1, L4 and L5 -> 2; region 0 holds no local layer.
     assert consumer.kv_caches_base_addr == [0xB000, 0xC000]
 
-    plan = TPMapping(((0,), (0,)), (0,), {0: 0}, 0)
+    plan = TPMapping(((0,), (0,)), (0,), {0: HeadWindow(0, 0, 1)}, 1)
     # Builders emit one strided run per region; expand to per-block descriptors.
     local_descs = expand_strided_descs(
         worker._build_fa_local([0x1000, 0x2000], block_size_ratio=1)
     )
     remote_descs = expand_strided_descs(
         worker._build_fa_remote(
-            plan, consumer, block_size_ratio=1, local_region_ids=pairs.partner
+            plan,
+            consumer,
+            block_size_ratio=1,
+            remote_tp_rank=0,
+            local_region_ids=pairs.partner,
         )
     )
     local_ids = worker._compute_desc_ids(
