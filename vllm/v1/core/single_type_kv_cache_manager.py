@@ -1183,7 +1183,50 @@ class RSWAManager(FullAttentionManager):
         return RetentionLaw(window=params.rswa_window, keep_prompt=True)
 
 
-class SlidingWindowManager(SingleTypeKVCacheManager):
+class LawWindowManager(SingleTypeKVCacheManager):
+    """A windowed attention kind declared only by its `retention_law`.
+
+    Prefix hits, freeing, skipped tokens and admission bounds all come from
+    the law, so a new windowed kind is its params plus one classmethod.
+    """
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        block_size: int,
+        manager_config: ManagerConfig,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        num_request_tokens: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        assert dcp_world_size == 1 and pcp_world_size == 1
+        block_hashes = resolve_block_hashes(
+            block_hashes,
+            block_pool.hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+            alignment_tokens=alignment_tokens,
+        )
+        law = cls.retention_law(manager_config)
+        assert law is not None, f"{cls.__name__} must declare a retention law"
+        return _longest_law_hit(
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            block_size,
+            alignment_tokens,
+            first_needed_block=lambda h: law.first_needed_block(h, block_size),
+            head_blocks=lambda h: law.head_blocks(h, block_size),
+        )
+
+
+class SlidingWindowManager(LawWindowManager):
     @dataclass(frozen=True, slots=True)
     class Params(SingleTypeKVCacheManager.Params):
         sliding_window: int
@@ -1242,48 +1285,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         params = self.manager_config.params
         assert isinstance(params, SlidingWindowManager.Params)
         self.num_retained_tokens = self.sliding_window_reach(self.manager_config)
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        block_size: int,
-        manager_config: ManagerConfig,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-        num_request_tokens: int | None = None,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        assert isinstance(manager_config.params, SlidingWindowManager.Params), (
-            "SlidingWindowManager can only be used for sliding window groups"
-        )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Sliding-window cache hits must stay at the group's physical block
-        # granularity. resolve_block_hashes() converts finer-grained hashes to
-        # that view when the hybrid-cache alignment is smaller than block_size.
-        block_hashes = resolve_block_hashes(
-            block_hashes,
-            block_pool.hash_block_size,
-            block_size,
-            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
-            alignment_tokens=alignment_tokens,
-        )
-
-        # A hit at h tokens needs the blocks covering [h - (W - 1), h).
-        law = cls.retention_law(manager_config)
-        return _longest_law_hit(
-            block_hashes,
-            max_length,
-            kv_cache_group_ids,
-            block_pool,
-            block_size,
-            alignment_tokens,
-            first_needed_block=lambda h: law.first_needed_block(h, block_size),
-        )
 
     @classmethod
     def reachable_block_mask(
@@ -1693,7 +1694,7 @@ class CircularBufferManager(SingleTypeKVCacheManager):
         return 0
 
 
-class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
+class ChunkedLocalAttentionManager(LawWindowManager):
     @dataclass(frozen=True, slots=True)
     class Params(SingleTypeKVCacheManager.Params):
         attention_chunk_size: int
@@ -1710,130 +1711,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         params = config.params
         assert isinstance(params, ChunkedLocalAttentionManager.Params)
         return RetentionLaw(chunk=params.attention_chunk_size)
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        block_size: int,
-        manager_config: ManagerConfig,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-        num_request_tokens: int | None = None,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        """For chunked local attention, we need to find the longest cache hit
-        prefix of the blocks that is not longer than `max_length`. The prefix
-        should be a common prefix hit for all the kv cache groups in
-        `kv_cache_group_ids`. If no cache hit is found, return an empty list.
-        note we mark as computed if the whole block is outside of the local
-        window, and set the block as null. Examples:
-
-        1. Attention chunk size of 8, block size of 4, max length of 15
-        for next token at 15th (zero-indexed), 8th - 14th tokens are in
-        the window(needs lookup), 0th - 7th are not in the window,
-        so they are already marked as computed. We check the complete
-        block3 (8th - 11th tokens), Assume block 3 is hit, we will return
-        [null, null, block 3], otherwise, we return [null, null]
-
-        2. Attention chunk size of 8, block size of 4, max length of 16
-        for next token at 16th (zero-indexed), 0th - 15th tokens are not
-        in the window, so they are already marked as computed.
-        we return 4 blocks[null, null, null, null]
-
-        Args:
-            block_hashes: The block hashes of the request.
-            max_length: The maximum length of the cache hit prefix.
-            kv_cache_group_ids: The ids of the kv cache groups.
-            block_pool: The block pool.
-            block_size: The groups' block size.
-            manager_config: The groups' manager config.
-            dcp_world_size: The world size of decode context parallelism.
-            pcp_world_size: The world size of prefill context parallelism.
-            alignment_tokens: The returned cache hit length (in tokens) should
-                be a multiple of this value (in tokens).
-            num_request_tokens: Unused; see the base class.
-
-        Returns:
-            A list of cached blocks
-
-        """
-        params = manager_config.params
-        assert isinstance(params, ChunkedLocalAttentionManager.Params), (
-            "ChunkedLocalAttentionManager can only be used for "
-            "chunked local attention groups"
-        )
-        assert dcp_world_size == 1, "DCP not support chunked local attn now."
-        assert pcp_world_size == 1, "PCP not support chunked local attn now."
-        assert block_size == alignment_tokens, (
-            "KV cache groups with different block sizes are not compatible with "
-            "chunked local attention now"
-        )
-        block_hashes = resolve_block_hashes(
-            block_hashes,
-            block_pool.hash_block_size,
-            block_size,
-            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
-            alignment_tokens=alignment_tokens,
-        )
-        # A hit at h tokens needs the blocks of h's own chunk before h; a hit
-        # on a chunk boundary needs nothing.
-        law = cls.retention_law(manager_config)
-        return _longest_law_hit(
-            block_hashes,
-            max_length,
-            kv_cache_group_ids,
-            block_pool,
-            block_size,
-            alignment_tokens,
-            first_needed_block=lambda h: law.first_needed_block(h, block_size),
-        )
-
-
-class LawWindowManager(SingleTypeKVCacheManager):
-    """A windowed attention kind declared only by its `retention_law`.
-
-    Prefix hits, freeing, skipped tokens and admission bounds all come from
-    the law, so a new windowed kind is its params plus one classmethod.
-    """
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        block_size: int,
-        manager_config: ManagerConfig,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-        num_request_tokens: int | None = None,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        assert dcp_world_size == 1 and pcp_world_size == 1
-        block_hashes = resolve_block_hashes(
-            block_hashes,
-            block_pool.hash_block_size,
-            block_size,
-            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
-            alignment_tokens=alignment_tokens,
-        )
-        law = cls.retention_law(manager_config)
-        assert law is not None, f"{cls.__name__} must declare a retention law"
-        return _longest_law_hit(
-            block_hashes,
-            max_length,
-            kv_cache_group_ids,
-            block_pool,
-            block_size,
-            alignment_tokens,
-            first_needed_block=lambda h: law.first_needed_block(h, block_size),
-            head_blocks=lambda h: law.head_blocks(h, block_size),
-        )
 
 
 class SinkSlidingWindowManager(LawWindowManager):
