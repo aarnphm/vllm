@@ -55,6 +55,7 @@ class RetentionLaw:
     window: int = 0
     chunk: int = 0
     margin: int = 0
+    keep_prompt: bool = False
 
     def tail(self, n: int, margin: int = 0) -> int:
         if self.chunk:
@@ -62,7 +63,25 @@ class RetentionLaw:
         return max(0, n - self.window - margin)
 
     def skipped_tokens(self, num_computed_tokens: int) -> int:
+        """Tokens before the first one a future token attends to (0 when the
+        law keeps the prompt: R-SWA frees a middle gap, not a prefix)."""
+        if self.keep_prompt:
+            return 0
         return self.tail(num_computed_tokens, self.margin)
+
+    def free_range(
+        self, processed: int, num_prompt_tokens: int | None, block_size: int
+    ) -> tuple[int, int]:
+        """Blocks [lo, hi) that no future token reads once `processed` tokens
+        are processed. A prompt-keeping law frees the gap between the prompt
+        and the window, and only when the prompt length is known."""
+        if self.keep_prompt:
+            if num_prompt_tokens is None:
+                return (0, 0)
+            lo = cdiv(num_prompt_tokens, block_size)
+            hi = max(num_prompt_tokens, processed - self.window) // block_size
+            return (lo, hi)
+        return (0, self.skipped_tokens(processed) // block_size)
 
     def first_needed_block(self, h: int, block_size: int) -> int:
         return self.tail(h) // block_size
@@ -910,6 +929,13 @@ class SingleTypeKVCacheManager(ABC):
                 by the default implementation.
 
         """
+        law = type(self).retention_law(self.manager_config)
+        if law is not None:
+            lo, hi = law.free_range(
+                processed_computed_tokens, num_prompt_tokens, self.block_size
+            )
+            self._remove_blocks_in_range(request_id, lo, hi)
+            return
         del num_prompt_tokens
         # Remove the blocks that will be skipped during attention computation.
         num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
@@ -1109,37 +1135,15 @@ class RSWAManager(FullAttentionManager):
         assert isinstance(self.manager_config.params, RSWAManager.Params)
         self.rswa_window: int = self.manager_config.params.rswa_window
 
-    def remove_skipped_blocks(
-        self,
-        request_id: str,
-        processed_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
-    ) -> None:
-        """Free gap blocks that are no longer needed for attention.
-
-        Gap = blocks entirely within
-            [ceil(prefix_len / block_size) * block_size,
-             max(prefix_len, processed_computed_tokens - rswa_window))
-
-        Freed blocks are replaced with null_block in req_to_blocks so the
-        block_table passed to FA4 is valid (null_block KV is all-zero;
-        rswa_mask_mod marks gap positions as non-visible so FA4 skips them).
-        """
-        if num_prompt_tokens is None:
-            super().remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
-            )
-            return
-
-        bs = self.block_size
-        # First block fully after the prefill boundary.
-        first_gap_block = cdiv(num_prompt_tokens, bs)
-        # Decode window start position; blocks before this are evictable.
-        window_start = max(
-            num_prompt_tokens, processed_computed_tokens - self.rswa_window
-        )
-        last_gap_block = window_start // bs  # exclusive upper bound
-        self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
+    @classmethod
+    def retention_law(cls, config: ManagerConfig) -> RetentionLaw:
+        """The prompt plus the last `rswa_window` tokens. Freed gap blocks are
+        replaced with the null block (all-zero KV); the R-SWA mask marks gap
+        positions non-visible so FA4 skips them. Prefix hits keep full
+        attention's rule."""
+        params = config.params
+        assert isinstance(params, RSWAManager.Params)
+        return RetentionLaw(window=params.rswa_window, keep_prompt=True)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1300,7 +1304,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             # drops a block that could serve a hit.
             return None
 
-        need = cdiv(manager_config.params.sliding_window - 1, block_size)
+        need = cdiv(cls.retention_law(manager_config).window, block_size)
 
         mask = [False] * (end_block - start_block)
 
