@@ -68,6 +68,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     HiSparseHotManager,
     HiSparseResidentManager,
     HiSparseSourceManager,
+    SinkFullAttentionManager,
 )
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.hisparse.types import SparseKVOffloadCommand, SparseKVPageTransfer
@@ -4084,6 +4085,39 @@ def test_reset_prefix_cache():
     assert manager.block_pool.cached_block_hash_to_block is cache
     assert not cache and not gc.is_tracked(cache._cache)
     assert all([blk.block_hash is None for blk in manager.block_pool.blocks])
+
+
+def test_static_sink_blocks_are_never_allocated():
+    """`StaticSinkAttention` keeps its sink KV in blocks 1..sink_len/block_size
+    and prepends them to every block table row, so no request may own them,
+    also after a prefix cache reset. Holding them back must not fail the reset
+    or count as usage."""
+    block_size = 16
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    sink = SinkFullAttentionManager.layer_config(spec, sink_len=2 * block_size)
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=11,
+            kv_cache_tensors=[],
+            kv_cache_groups=[new_kv_cache_group(["layer"], sink)],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    for request_id in ("0", "1"):
+        # Take every block except the null block and the two sink blocks.
+        req = make_request(request_id, [0] * 8 * block_size, block_size, sha256)
+        blocks = manager.allocate_slots(req, 8 * block_size)
+        assert blocks is not None
+        assert sorted(blocks.get_block_ids()[0]) == list(range(3, 11))
+        assert manager.usage == 1.0
+        manager.free(req)
+        assert manager.usage == 0.0
+        assert manager.reset_prefix_cache()
 
 
 def test_prefix_cache_stats_disabled():

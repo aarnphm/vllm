@@ -2800,11 +2800,20 @@ class SinkFullAttentionManager(FullAttentionManager):
     class Params(SingleTypeKVCacheManager.Params):
         sink_len: int
 
+    @classmethod
+    def sink_block_ids(cls, config: ManagerConfig, block_size: int) -> range:
+        """The blocks `StaticSinkAttention` keeps the sink KV in and prepends to
+        every block table row. No request may own them."""
+        assert isinstance(config.params, SinkFullAttentionManager.Params)
+        sink_len = config.params.sink_len
+        assert sink_len > 0 and sink_len % block_size == 0
+        return range(1, sink_len // block_size + 1)
+
     def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
         super().__init__(kv_cache_group, **kwargs)
-        assert isinstance(self.manager_config.params, SinkFullAttentionManager.Params)
-        sink_len = self.manager_config.params.sink_len
-        assert sink_len > 0 and sink_len % self.block_size == 0
+        self.block_pool.reserve_blocks(
+            self.sink_block_ids(self.manager_config, self.block_size)
+        )
 
 
 class HiSparseSourceManager(FullAttentionManager):

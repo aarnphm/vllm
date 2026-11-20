@@ -24,6 +24,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     MambaManager,
+    SinkFullAttentionManager,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -81,6 +82,18 @@ def _mamba_group(enable_prefix_caching: bool) -> KVCacheGroup:
             MambaSpec(block_size=BLOCK_SIZE, shapes=((1,),), dtypes=(torch.float32,)),
             enable_prefix_caching=enable_prefix_caching,
             num_speculative_blocks=NUM_SPEC_STEPS,
+        ),
+    )
+
+
+def _sink_group() -> KVCacheGroup:
+    return new_kv_cache_group(
+        ["sink"],
+        SinkFullAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+            sink_len=2 * BLOCK_SIZE,
         ),
     )
 
@@ -403,6 +416,32 @@ def test_warmup_reserves_mamba_speculative_blocks(enable_prefix_caching):
             f"blocks for {num_computed}+{num_scheduled} tokens and {lookahead} "
             "lookahead"
         )
+
+
+def test_warmup_leaves_static_sink_blocks_alone():
+    """`StaticSinkAttention` writes its sink KV to blocks 1..2 once, on the
+    first forward, and every later step reads it there. Warmup runs after that
+    forward, so like the scheduler it must not hand those blocks out."""
+    runner = _make_runner([_sink_group()], num_lookahead_tokens=0, num_spec_steps=0)
+    outputs: list[SchedulerOutput] = []
+
+    warmup_kernels(runner, outputs.append, lambda grammar_output: None)
+    assert run_mixed_prefill_decode_warmup(
+        runner, outputs.append, lambda grammar_output: None, num_tokens=128
+    )
+    assert run_context_prefill_warmup(
+        runner, outputs.append, lambda grammar_output: None, MAX_MODEL_LEN
+    )
+
+    block_ids: set[int] = set()
+    for output in outputs:
+        for request in output.scheduled_new_reqs:
+            block_ids.update(*request.block_ids)
+        for new_block_ids in output.scheduled_cached_reqs.new_block_ids:
+            if new_block_ids is not None:
+                block_ids.update(*new_block_ids)
+    assert block_ids, "warmup handed out no blocks"
+    assert not block_ids & {1, 2}
 
 
 def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
