@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for attention configuration and per-KV-group backend selection."""
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -173,6 +174,30 @@ def test_backend_per_kind_rejects_unknown_kind():
     backend_per_kind: dict[str, str] = {"not_a_kind": "TRITON_MLA"}
     with pytest.raises(ValueError, match="Unknown KV cache group kind"):
         AttentionConfig(backend_per_kind=backend_per_kind)
+
+
+def test_backend_per_kind_accepts_only_selectable_kinds():
+    """Every accepted key must be a kind backend selection can assign, or the
+    entry is silently ignored (e.g. `chunked_local_attention`: Llama 4's
+    chunked-local layers select as `full_attention`)."""
+    selectable = {
+        get_attn_spec_kind(use_mla=mla, has_sliding_window=sw, attn_type=attn_type)
+        for mla, sw, attn_type in itertools.product(
+            (False, True), (False, True), AttentionType
+        )
+    }
+    valid_kinds = f"Valid kinds are: {', '.join(sorted(selectable))}."
+    accepted = set()
+    for kind in KVCacheSpecKind:
+        try:
+            AttentionConfig(
+                backend_per_kind={kind.value: AttentionBackendEnum.TRITON_ATTN}
+            )
+        except ValueError as e:
+            assert valid_kinds in str(e)
+        else:
+            accepted.add(kind)
+    assert accepted == selectable
 
 
 @pytest.mark.parametrize(

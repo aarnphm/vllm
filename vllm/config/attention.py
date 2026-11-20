@@ -56,6 +56,11 @@ class AttentionConfig:
     layers across multiple KV-cache groups (e.g. interleaved full and
     sliding-window attention) use a different backend per group.
 
+    Valid keys are `full_attention`, `mla_attention`, `sliding_window`,
+    `sliding_window_mla`, `encoder_only_attention` and `cross_attention`.
+    Chunked-local layers (e.g. Llama 4) select their backend as
+    `full_attention`, and Mamba layers do not use attention backends.
+
     An entry overrides `backend` for layers of the matching kind; kinds not
     listed fall back to `backend` (or automatic selection). A selected backend
     that is invalid for that kind raises at startup."""
@@ -297,21 +302,38 @@ class AttentionConfig:
     def validate_backend_per_kind_before(cls, value: Any) -> Any:
         """Parse the `backend_per_kind` map from strings.
 
-        Keys must be valid `KVCacheSpecKind` values; values are parsed like
+        Keys must be `KVCacheSpecKind` values that backend selection assigns
+        to a layer (see `get_attn_spec_kind`); values are parsed like
         `backend` (enum name, case-insensitive).
         """
         from vllm.v1.kv_cache_interface import KVCacheSpecKind
 
         if not isinstance(value, dict):
             return value
-        valid_kinds = {kind.value for kind in KVCacheSpecKind}
+        valid_kinds = {
+            KVCacheSpecKind.FULL_ATTENTION,
+            KVCacheSpecKind.MLA_ATTENTION,
+            KVCacheSpecKind.SLIDING_WINDOW,
+            KVCacheSpecKind.SLIDING_WINDOW_MLA,
+            KVCacheSpecKind.ENCODER_ONLY_ATTENTION,
+            KVCacheSpecKind.CROSS_ATTENTION,
+        }
         parsed: dict[str, AttentionBackendEnum] = {}
         for kind, backend in value.items():
             if kind not in valid_kinds:
+                if kind in {k.value for k in KVCacheSpecKind}:
+                    problem = (
+                        f"backend_per_kind cannot target '{kind}': backend "
+                        "selection never assigns that kind. Chunked-local "
+                        "layers select as 'full_attention', and Mamba layers "
+                        "do not use attention backends."
+                    )
+                else:
+                    problem = (
+                        f"Unknown KV cache group kind '{kind}' in backend_per_kind."
+                    )
                 raise ValueError(
-                    f"Unknown KV cache group kind '{kind}' in "
-                    f"backend_per_kind. Valid kinds are: "
-                    f"{', '.join(sorted(valid_kinds))}."
+                    f"{problem} Valid kinds are: {', '.join(sorted(valid_kinds))}."
                 )
             if isinstance(backend, str):
                 backend = AttentionBackendEnum[backend.upper()]
