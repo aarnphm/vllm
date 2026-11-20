@@ -69,6 +69,15 @@ def create_static_sink_attention_backend(
                 device=device,
                 dtype=torch.int32,
             )
+            # The caller's seq_lens is the runner's batch tensor, which the
+            # sampler and drafters read after this build, so the sink lengths
+            # live in a buffer of their own. It is persistent for CUDA graphs.
+            self.seq_lens_with_sink = torch.zeros(
+                scheduler_config.max_num_seqs, device=device, dtype=torch.int32
+            )
+            # build() restages seq_lens, which the in-place
+            # update_draft_decode_metadata() does not refresh.
+            self.supports_draft_decode_metadata_update = False
 
         def build(
             self,
@@ -76,23 +85,23 @@ def create_static_sink_attention_backend(
             common_attn_metadata: CommonAttentionMetadata,
             fast_build: bool = False,
         ) -> AttentionMetadata:
-            common_attn_metadata.seq_lens[:] = (
-                common_attn_metadata.seq_lens + self.sink_len
-            )
-            common_attn_metadata.seq_lens[
-                common_attn_metadata.seq_lens == self.sink_len
-            ] = 0
-            common_attn_metadata.max_seq_len = (
-                common_attn_metadata.max_seq_len + self.sink_len
-            )
-            max_num_blocks = cdiv(common_attn_metadata.max_seq_len, self.block_size)
             num_reqs = common_attn_metadata.num_reqs
+            seq_lens = common_attn_metadata.seq_lens
+            seq_lens_with_sink = self.seq_lens_with_sink[:num_reqs]
+            torch.add(seq_lens, self.sink_len, out=seq_lens_with_sink)
+            # Padded requests keep a zero length.
+            seq_lens_with_sink.masked_fill_(seq_lens == 0, 0)
+            max_seq_len = common_attn_metadata.max_seq_len + self.sink_len
+            max_num_blocks = cdiv(max_seq_len, self.block_size)
             self.block_table_with_sink[
                 :num_reqs, self.num_sink_blocks : self.num_sink_blocks + max_num_blocks
             ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
-            common_attn_metadata.block_table_tensor = self.block_table_with_sink[
-                :num_reqs
-            ]
+            common_attn_metadata = common_attn_metadata.replace(
+                seq_lens=seq_lens_with_sink,
+                max_seq_len=max_seq_len,
+                block_table_tensor=self.block_table_with_sink[:num_reqs],
+                _num_computed_tokens_cache=None,
+            )
 
             return super().build(common_prefix_len, common_attn_metadata, fast_build)
 
