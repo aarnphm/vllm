@@ -386,6 +386,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if dcp_active:
                     local_ids = group_ids(meta.local_block_ids, rank)
                     remote_ids = group_ids(remote_logical_block_ids, rank)
+                    transfer_groups = self.kv_cache_config.transfer_group_ids
                     for g in range(num_groups):
                         if not local_ids[g] or not _is_attention_spec(
                             self._group_spec_types[g]
@@ -414,7 +415,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             local_dcp_rank=self.dcp_rank,
                             remote_dcp_size=remote_info.remote_dcp_size,
                             local_num_computed_blocks=(
-                                meta.local_num_computed_blocks[g]
+                                meta.local_num_computed_blocks[transfer_groups[g]]
                             ),
                         )
                     local_physical_ids = self._logical_to_kernel_block_ids(

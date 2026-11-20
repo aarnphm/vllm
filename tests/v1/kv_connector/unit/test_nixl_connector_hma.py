@@ -359,6 +359,81 @@ def test_dcp_pull_reads_replicated_draft_group_from_one_rank(
 
 
 @pytest.mark.cpu_test
+def test_dcp_pull_skips_each_groups_own_prefix_hit(region_pull_worker):
+    """The scheduler counts prefix hits per KV cache group, including HiSparse's
+    resident group, which does not transfer. Each uncached page of a transfer
+    group must read the same page on P, not one shifted by another group's hit."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
+        NixlPullConnectorScheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    worker = region_pull_worker
+    remote = worker.transfer_topo.get_engine_info.return_value
+    remote.remote_tp_size = remote.remote_dcp_size = 4
+    remote.remote_physical_blocks_per_logical = 1
+    ranks = tuple(range(4))
+    worker.tp_mappings["P"] = TPMapping((ranks, ranks), ranks, {r: r for r in ranks}, 0)
+    worker._remote_stages["P"] = remote_stage(
+        region_pairs_by_index(2, groups=[0, 1]),
+        region_num_blocks=[100, 100],
+        region_group_ids=[0, 1],
+        xfer_side_handles={r: 1000 + r for r in ranks},
+    )
+    worker._remote_agents = {"P": {(0, r): f"P-rank{r}" for r in ranks}}
+    # 8 pages over 4 remote DCP ranks: page p of transfer group g (host,
+    # indexer) is block 10 + 10 * g + p // 4 on remote rank p % 4 and block
+    # 30 + 10 * g + p here, where its first g + 1 pages are cached. The
+    # resident group (block 50 + p) caches nothing. Region g's descriptors
+    # start at 100 * g.
+    blocks = KVCacheBlocks(
+        blocks=tuple(
+            [
+                KVCacheBlock(base + p, block_hash=object() if p < hit else None)
+                for p in range(8)
+            ]
+            for base, hit in ((50, 0), (30, 1), (40, 2))
+        )
+    )
+    request = create_request(do_remote_prefill=True)
+    assert request.kv_transfer_params is not None
+    request.kv_transfer_params.update(
+        remote_engine_id="P",
+        remote_host="localhost",
+        remote_port=1,
+        remote_block_ids=[[10, 11], [20, 21]],
+    )
+    scheduler = NixlPullConnectorScheduler(
+        create_vllm_config(block_size=64), "D", worker.kv_cache_config
+    )
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=7 * 64)
+    metadata = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    scheduler.shutdown()
+    worker._read_blocks_for_req(
+        request.request_id, metadata.reqs_to_recv[request.request_id]
+    )
+    reads = {
+        call.kwargs["remote_xfer_side_handle"] - 1000: list(
+            zip(
+                call.kwargs["local_block_descs_ids"],
+                call.kwargs["remote_block_descs_ids"],
+            )
+        )
+        for call in worker._read_blocks_mixed.call_args_list
+    }
+    for rank in ranks:
+        assert reads[rank] == [
+            (100 * g + 30 + 10 * g + p, 100 * g + 10 + 10 * g + p // 4)
+            for g in range(2)
+            for p in range(g + 1, 8)
+            if p % 4 == rank
+        ]
+
+
+@pytest.mark.cpu_test
 def test_region_pull_completion_zeros_only_own_padding(region_pull_worker):
     """Completion must preserve neighboring layers and already imported pages."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
