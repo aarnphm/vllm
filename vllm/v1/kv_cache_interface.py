@@ -760,6 +760,10 @@ class KVCacheGroup:
         return self.manager_cls.sliding_window_reach(self.manager_config)
 
     @property
+    def sliding_window_keeps_prompt(self) -> bool:
+        return self.manager_cls.sliding_window_keeps_prompt(self.manager_config)
+
+    @property
     def uses_slot_mapping(self) -> bool:
         return self.manager_cls.uses_slot_mapping and any(
             spec.uses_slot_mapping for spec in self.distinct_specs

@@ -19,6 +19,7 @@ class CPUBlockTables:
         device: torch.device,
         slot_mapping_enabled: list[bool] | None = None,
         sliding_window_reach: list[int] | None = None,
+        sliding_window_keeps_prompt: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
@@ -35,6 +36,10 @@ class CPUBlockTables:
         assert len(sliding_window_reach) == self.num_kv_cache_groups
         self._sliding_window_reach = sliding_window_reach
         self.has_sliding_window_groups = any(r > 0 for r in sliding_window_reach)
+        if sliding_window_keeps_prompt is None:
+            sliding_window_keeps_prompt = [False] * self.num_kv_cache_groups
+        assert len(sliding_window_keeps_prompt) == self.num_kv_cache_groups
+        self._sliding_window_keeps_prompt = sliding_window_keeps_prompt
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[torch.Tensor] = []
@@ -93,6 +98,7 @@ class CPUBlockTables:
         num_reqs_padded: int,
         out: tuple[torch.Tensor, ...] | None = None,
         num_computed_tokens: torch.Tensor | None = None,
+        prompt_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Gather the batch's block-table rows into the forward-pass tables.
 
@@ -102,7 +108,9 @@ class CPUBlockTables:
         blocks may already have been freed by the sliding-window manager and
         reused, while attention kernels can still load them as part of a KV
         tile that straddles the window start: masked-out NaN in such a tile
-        propagates into the output.
+        propagates into the output. Groups that keep the prompt (R-SWA) null
+        only the entries after the prompt, so they need prompt_lens
+        ([max_num_reqs], indexed the same way).
         """
         if self.num_kv_cache_groups == 0:
             return ()
@@ -137,9 +145,15 @@ class CPUBlockTables:
                 block_indices = torch.arange(
                     output.shape[1], dtype=torch.int32, device=output.device
                 )
-                output[:num_reqs].masked_fill_(
-                    block_indices.unsqueeze(0) < num_masked_blocks.unsqueeze(1), 0
-                )
+                masked = block_indices.unsqueeze(0) < num_masked_blocks.unsqueeze(1)
+                if self._sliding_window_keeps_prompt[group_id]:
+                    assert prompt_lens is not None, "R-SWA masking needs prompt_lens"
+                    block_size = self.block_sizes[group_id]
+                    num_prompt_blocks = (
+                        prompt_lens[idx_mapping] + block_size - 1
+                    ) // block_size
+                    masked &= block_indices.unsqueeze(0) >= num_prompt_blocks[:, None]
+                output[:num_reqs].masked_fill_(masked, 0)
         return tuple(block_table[:num_reqs_padded] for block_table in out)
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:

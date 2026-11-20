@@ -48,6 +48,7 @@ class BlockTables:
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
         sliding_window_reach: list[int] | None = None,
+        sliding_window_keeps_prompt: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
@@ -77,6 +78,13 @@ class BlockTables:
         assert len(sliding_window_reach) == self.num_kv_cache_groups
         self._sliding_window_reach = sliding_window_reach
         self.has_sliding_window_groups = any(r > 0 for r in sliding_window_reach)
+        # Per group, whether the prompt stays readable below the reach (R-SWA):
+        # then only the gap between the prompt and the window is masked.
+        if sliding_window_keeps_prompt is None:
+            sliding_window_keeps_prompt = [False] * self.num_kv_cache_groups
+        assert len(sliding_window_keeps_prompt) == self.num_kv_cache_groups
+        self._sliding_window_keeps_prompt = sliding_window_keeps_prompt
+        self.has_prompt_keeping_groups = any(sliding_window_keeps_prompt)
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -133,6 +141,9 @@ class BlockTables:
         self.sliding_window_reach = torch.tensor(
             self._sliding_window_reach, dtype=torch.int32, device=self.device
         )
+        self.sliding_window_keeps_prompt = torch.tensor(
+            self._sliding_window_keeps_prompt, dtype=torch.bool, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
     def append_block_ids(
@@ -177,6 +188,7 @@ class BlockTables:
         out: tuple[torch.Tensor, ...] | None = None,
         out_ptrs: torch.Tensor | None = None,
         num_computed_tokens: torch.Tensor | None = None,
+        prompt_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Gather the batch's block-table rows into the forward-pass tables.
 
@@ -186,16 +198,23 @@ class BlockTables:
         blocks may already have been freed by the sliding-window manager and
         reused, while attention kernels can still load them as part of a KV
         tile that straddles the window start: masked-out NaN in such a tile
-        propagates into the output.
+        propagates into the output. Groups that keep the prompt (R-SWA) null
+        only the entries after the prompt, so they need prompt_lens
+        ([max_num_reqs], indexed the same way).
         """
         if self.num_kv_cache_groups == 0:
             return ()
         mask_sliding_window = (
             self.has_sliding_window_groups and num_computed_tokens is not None
         )
+        mask_prompt_gap = mask_sliding_window and self.has_prompt_keeping_groups
+        if mask_prompt_gap:
+            assert prompt_lens is not None, "R-SWA masking needs prompt_lens"
         if not mask_sliding_window:
             # Unused by the kernel; any int32 tensor satisfies the signature.
             num_computed_tokens = self.sliding_window_reach
+        if not mask_prompt_gap:
+            prompt_lens = self.sliding_window_reach
         num_reqs = idx_mapping.shape[0]
         num_rows = num_reqs_padded
         if out is None:
@@ -216,9 +235,12 @@ class BlockTables:
             self.num_blocks.gpu.stride(0),
             num_reqs,
             num_computed_tokens,
+            prompt_lens,
             self.sliding_window_reach,
+            self.sliding_window_keeps_prompt,
             self.block_sizes_tensor,
             MASK_SLIDING_WINDOW=mask_sliding_window,
+            MASK_PROMPT_GAP=mask_prompt_gap,
             BLOCK_SIZE=1024,  # type: ignore
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
@@ -299,9 +321,12 @@ def _gather_block_tables_kernel(
     num_blocks_stride,
     num_reqs,  # actual number of requests (for padding)
     num_computed_tokens_ptr,  # [max_num_reqs]
+    prompt_lens_ptr,  # [max_num_reqs]
     sliding_window_reach_ptr,  # [num_kv_cache_groups]
+    sliding_window_keeps_prompt_ptr,  # [num_kv_cache_groups]
     block_sizes_ptr,  # [num_kv_cache_groups]
     MASK_SLIDING_WINDOW: tl.constexpr,
+    MASK_PROMPT_GAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -327,23 +352,27 @@ def _gather_block_tables_kernel(
     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
     src_row_ptr = src_block_table_ptr + req_idx * stride
 
-    # Leading entries no query of this step can attend: null them (see
-    # BlockTables.gather_block_tables).
-    num_null = 0
+    # Entries [null_start, null_end) no query of this step can attend: null
+    # them (see BlockTables.gather_block_tables).
+    null_start = 0
+    null_end = 0
     if MASK_SLIDING_WINDOW:
         reach = tl.load(sliding_window_reach_ptr + group_id)
         first_pos = tl.load(num_computed_tokens_ptr + req_idx)
         block_size = tl.load(block_sizes_ptr + group_id)
-        num_null = tl.where(
+        null_end = tl.where(
             reach > 0, tl.maximum(first_pos - reach, 0) // block_size, 0
         )
+        if MASK_PROMPT_GAP:
+            keeps_prompt = tl.load(sliding_window_keeps_prompt_ptr + group_id)
+            prompt_len = tl.load(prompt_lens_ptr + req_idx)
+            null_start = tl.where(keeps_prompt, tl.cdiv(prompt_len, block_size), 0)
 
     for i in tl.range(0, num_blocks, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
+        live = (offset < null_start) | (offset >= null_end)
         block_ids = tl.load(
-            src_row_ptr + offset,
-            mask=(offset >= num_null) & (offset < num_blocks),
-            other=0,
+            src_row_ptr + offset, mask=live & (offset < num_blocks), other=0
         )
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 

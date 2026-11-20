@@ -90,6 +90,11 @@ class SingleTypeKVCacheManager(ABC):
         return 0
 
     @classmethod
+    def sliding_window_keeps_prompt(cls, config: ManagerConfig) -> bool:
+        """Whether the prompt stays readable below `sliding_window_reach`."""
+        return False
+
+    @classmethod
     def can_share_block_table(cls, specs: Sequence[KVCacheSpec]) -> bool:
         """Whether layers with these layouts can share one block table, given
         they already share this manager's policy, block size and DCP sharding."""
@@ -1032,6 +1037,18 @@ class RSWAManager(FullAttentionManager):
         assert isinstance(self.manager_config.params, RSWAManager.Params)
         self.rswa_window: int = self.manager_config.params.rswa_window
 
+    @classmethod
+    def sliding_window_reach(cls, config: ManagerConfig) -> int:
+        # The window start `remove_skipped_blocks` frees below; attention
+        # reads one token less.
+        params = config.params
+        assert isinstance(params, RSWAManager.Params)
+        return params.rswa_window
+
+    @classmethod
+    def sliding_window_keeps_prompt(cls, config: ManagerConfig) -> bool:
+        return True
+
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -1044,9 +1061,11 @@ class RSWAManager(FullAttentionManager):
             [ceil(prefix_len / block_size) * block_size,
              max(prefix_len, processed_computed_tokens - rswa_window))
 
-        Freed blocks are replaced with null_block in req_to_blocks so the
-        block_table passed to FA4 is valid (null_block KV is all-zero;
-        rswa_mask_mod marks gap positions as non-visible so FA4 skips them).
+        Freed blocks are replaced with null_block in req_to_blocks. The
+        worker's block table only receives appended ids, so the worker nulls
+        the same entries itself from `sliding_window_reach` and
+        `sliding_window_keeps_prompt` (`BlockTables.gather_block_tables`):
+        FA4 and Triton attention load every gap tile and only mask its scores.
         """
         if num_prompt_tokens is None:
             super().remove_skipped_blocks(

@@ -563,7 +563,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if self.pcp_manager is not None and not dummy_run:
             self.block_tables.gather_block_tables(
-                input_batch.idx_mapping, num_reqs_padded=num_reqs
+                input_batch.idx_mapping,
+                num_reqs_padded=num_reqs,
+                num_computed_tokens=self.pcp_manager.num_computed_tokens,
             )
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.

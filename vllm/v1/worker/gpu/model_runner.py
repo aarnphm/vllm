@@ -778,12 +778,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             slot_mapping_enabled=[g.uses_slot_mapping for g in kv_cache_groups],
             dcp_sharded=[g.dcp_sharded for g in kv_cache_groups],
             sliding_window_reach=[g.sliding_window_reach for g in kv_cache_groups],
+            sliding_window_keeps_prompt=[
+                g.sliding_window_keeps_prompt for g in kv_cache_groups
+            ],
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
         )
         if self.pcp_manager is not None:
-            self.pcp_manager.set_block_tables(self.block_tables)
+            self.pcp_manager.set_block_tables(
+                self.block_tables, self.req_states.num_computed_tokens.gpu
+            )
         self.ubatch_runner = maybe_build_ubatch_runner(
             self.vllm_config,
             self.device,
@@ -1703,6 +1708,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
             num_computed_tokens=self.req_states.num_computed_tokens.gpu,
+            prompt_lens=self.req_states.prompt_len.gpu,
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.

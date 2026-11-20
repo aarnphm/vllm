@@ -106,9 +106,22 @@ class PCPManager:
         self._max_num_tokens = max_num_tokens
         self.set_block_tables(block_tables)
 
-    def set_block_tables(self, block_tables: BlockTables | None) -> None:
-        """Attach the KV block tables, which only exist after KV cache init."""
+    def set_block_tables(
+        self,
+        block_tables: BlockTables | None,
+        num_computed_tokens: torch.Tensor | None = None,
+    ) -> None:
+        """Attach the KV block tables, which only exist after KV cache init.
+
+        Args:
+            block_tables: The worker's block tables.
+            num_computed_tokens: The request-indexed computed-token cursor
+                ([max_num_reqs]). PCP keeps every token's KV on every rank, so
+                gathers use it to null sliding-window entries as without PCP.
+
+        """
         self._block_tables = block_tables
+        self.num_computed_tokens = num_computed_tokens
         if block_tables is not None:
             self.cp_interleave = block_tables.cp_interleave
         max_num_local_reqs = self._max_num_local_reqs
@@ -767,6 +780,7 @@ class PCPManager:
             input_batch.num_reqs_after_padding,
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
+            num_computed_tokens=self.num_computed_tokens,
         )
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings

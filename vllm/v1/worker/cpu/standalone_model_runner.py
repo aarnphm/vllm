@@ -374,10 +374,14 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
         sliding_window_reach = []
+        sliding_window_keeps_prompt = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             block_sizes.append(kv_cache_group.block_size)
             slot_mapping_enabled.append(kv_cache_group.uses_slot_mapping)
             sliding_window_reach.append(kv_cache_group.sliding_window_reach)
+            sliding_window_keeps_prompt.append(
+                kv_cache_group.sliding_window_keeps_prompt
+            )
             max_num_blocks_per_group.append(
                 kv_cache_group.block_table_width(
                     self.vllm_config, block_table_max_model_len
@@ -399,6 +403,7 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             slot_mapping_enabled=slot_mapping_enabled,
             sliding_window_reach=sliding_window_reach,
+            sliding_window_keeps_prompt=sliding_window_keeps_prompt,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
@@ -896,6 +901,7 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
             num_computed_tokens=self.req_states.num_computed_tokens,
+            prompt_lens=self.req_states.prompt_len,
         )
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,

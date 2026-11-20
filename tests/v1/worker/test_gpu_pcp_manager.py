@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.attention.ops import pcp as attention_pcp
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -718,6 +719,51 @@ def _make_global_decode_batch(
         is_padding=buffers.is_padding[:num_tokens],
         prompt_lens=None,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU kernels")
+def test_prepare_attn_nulls_blocks_below_sliding_window():
+    """Without DCP every PCP rank holds every token's KV, so sliding-window
+    entries wholly below the window may point at freed and reused blocks, as
+    without PCP, and must reach attention as the null block."""
+    device = torch.device("cuda:0")
+    block_tables = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=4,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[16],
+        device=device,
+        sliding_window_reach=[31],
+    )
+    swa_ids = [list(range(21, 33)), list(range(61, 73))]
+    for req_index, block_ids in enumerate(swa_ids):
+        block_tables.append_block_ids(req_index, (block_ids,), overwrite=True)
+    block_tables.apply_staged_writes()
+    num_computed_tokens = [145, 120]
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=device,
+        shard_decode_requests=False,
+        max_num_reqs=4,
+        max_num_tokens=8,
+    )
+    manager.set_block_tables(
+        block_tables, torch.tensor(num_computed_tokens + [0, 0], device=device).int()
+    )
+    local_batch = manager.partition_batch(
+        _make_global_decode_batch(
+            num_computed_tokens, InputBuffers(4, 8, device), device
+        ),
+        BatchExecutionDescriptor(cg_mode=CUDAGraphMode.NONE, num_tokens=2, num_reqs=2),
+    )
+
+    (swa,), _ = manager.prepare_attn(local_batch)
+
+    # Replicated decodes put both requests on rank 0. They read back to
+    # 145 - 31 = 114 (block 7) and 120 - 31 = 89 (block 5).
+    assert swa[0, :12].tolist() == [0] * 7 + swa_ids[0][7:]
+    assert swa[1, :12].tolist() == [0] * 5 + swa_ids[1][5:]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU kernels")

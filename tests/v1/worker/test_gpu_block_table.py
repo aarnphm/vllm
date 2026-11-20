@@ -6,6 +6,9 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import RSWAManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
@@ -425,6 +428,59 @@ def test_gather_block_tables_nulls_blocks_below_sliding_window():
     _, swa = block_tables.gather_block_tables(idx_mapping, num_reqs_padded=2)
     torch.accelerator.synchronize()
     assert swa[0, :12].tolist() == swa_ids[0]
+
+
+def test_gather_block_tables_nulls_rswa_gap_the_manager_freed():
+    """R-SWA frees the blocks between the prompt and the decode window in the
+    scheduler only, and the worker's table keeps their ids. FA4 and Triton
+    attention load every KV tile of the row, so the forward-pass table must
+    null each freed block and keep every block the R-SWA mask reads."""
+    device = torch.device("cuda")
+    block_size, window, prompt_len, num_tokens = 16, 32, 40, 150
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float16
+    )
+    group = KVCacheGroup.from_layers(
+        {"layer": RSWAManager.layer_config(spec, rswa_window=window)}
+    )
+    manager = RSWAManager(
+        group,
+        block_pool=BlockPool(32, enable_caching=False, hash_block_size=block_size),
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    blocks = manager.allocate_new_blocks("req", num_tokens, num_tokens)
+    block_ids = [block.block_id for block in blocks]
+    manager.remove_skipped_blocks("req", num_tokens, num_prompt_tokens=prompt_len)
+    freed = [i for i, block in enumerate(manager.req_to_blocks["req"]) if block.is_null]
+    assert freed
+
+    block_tables = BlockTables(
+        block_sizes=[block_size],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[16],
+        device=device,
+        sliding_window_reach=[group.sliding_window_reach],
+        sliding_window_keeps_prompt=[group.sliding_window_keeps_prompt],
+    )
+    block_tables.append_block_ids(1, (block_ids,), overwrite=True)
+    block_tables.apply_staged_writes()
+    # Request slot 1 decodes its next token at position num_tokens.
+    (table,) = block_tables.gather_block_tables(
+        torch.tensor([1], dtype=torch.int32, device=device),
+        num_reqs_padded=1,
+        num_computed_tokens=torch.tensor([0, num_tokens], device=device).int(),
+        prompt_lens=torch.tensor([0, prompt_len], device=device).int(),
+    )
+    torch.accelerator.synchronize()
+
+    row = table[0, : len(block_ids)].tolist()
+    assert [row[i] for i in freed] == [0] * len(freed)
+    read = {pos // block_size for pos in range(prompt_len)}
+    read |= {pos // block_size for pos in range(num_tokens - window + 1, num_tokens)}
+    assert [row[i] for i in sorted(read)] == [block_ids[i] for i in sorted(read)]
 
 
 @pytest.fixture
