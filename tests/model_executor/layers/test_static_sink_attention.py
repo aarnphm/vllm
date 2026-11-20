@@ -61,6 +61,49 @@ def test_decode_context_parallelism_is_refused_when_the_model_is_built():
         )
 
 
+def test_weight_reload_refreshes_the_sink_tensors_in_place():
+    """Captured CUDA graphs write the sink from the tensors bound when they were
+    captured. A weight reload hands the layer new sink K/V (OpenPangu's
+    `post_weight_load` builds a fresh normalized K), so the layer must copy them
+    into the bound tensors rather than rebind."""
+    from vllm.model_executor.layers.attention.static_sink_attention import (
+        StaticSinkAttention,
+    )
+    from vllm.v1.attention.backends.flash_attn_diffkv import (
+        FlashAttentionDiffKVBackend,
+    )
+
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=BLOCK_SIZE),
+    )
+    with set_current_vllm_config(config):
+        layer = StaticSinkAttention(
+            num_heads=1,
+            head_size=HEAD_DIM,
+            scale=HEAD_DIM**-0.5,
+            sink_len=SINK_LEN,
+            num_kv_heads=1,
+            cache_config=config.cache_config,
+            prefix="model.layers.0.self_attn.attn",
+            attn_backend=FlashAttentionDiffKVBackend,
+            head_size_v=V_HEAD_DIM,
+        )
+    layer.update_sink_kv(
+        torch.zeros(SINK_LEN, 1, HEAD_DIM), torch.zeros(SINK_LEN, 1, V_HEAD_DIM)
+    )
+    assert layer.sink_key is not None and layer.sink_value is not None
+    addresses = (layer.sink_key.data_ptr(), layer.sink_value.data_ptr())
+
+    sink_key = torch.randn(SINK_LEN, 1, HEAD_DIM)
+    sink_value = torch.randn(SINK_LEN, 1, V_HEAD_DIM)
+    layer.update_sink_kv(sink_key, sink_value)
+
+    assert (layer.sink_key.data_ptr(), layer.sink_value.data_ptr()) == addresses
+    torch.testing.assert_close(layer.sink_key, sink_key, atol=0, rtol=0)
+    torch.testing.assert_close(layer.sink_value, sink_value, atol=0, rtol=0)
+
+
 def test_sink_read_ids_are_the_blocks_the_device_pool_keeps():
     """Beside a drafter with twice the page, the planner grows the sink group's
     blocks to 32 tokens while `CacheConfig.block_size` stays 16. The read table
