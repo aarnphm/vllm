@@ -56,6 +56,7 @@ class RetentionLaw:
     chunk: int = 0
     margin: int = 0
     keep_prompt: bool = False
+    head: int = 0  # tokens kept at the start (attention sinks)
 
     def tail(self, n: int, margin: int = 0) -> int:
         if self.chunk:
@@ -65,7 +66,7 @@ class RetentionLaw:
     def skipped_tokens(self, num_computed_tokens: int) -> int:
         """Tokens before the first one a future token attends to (0 when the
         law keeps the prompt: R-SWA frees a middle gap, not a prefix)."""
-        if self.keep_prompt:
+        if self.keep_prompt or self.head:
             return 0
         return self.tail(num_computed_tokens, self.margin)
 
@@ -81,7 +82,29 @@ class RetentionLaw:
             lo = cdiv(num_prompt_tokens, block_size)
             hi = max(num_prompt_tokens, processed - self.window) // block_size
             return (lo, hi)
-        return (0, self.skipped_tokens(processed) // block_size)
+        lo = cdiv(self.head, block_size)
+        return (lo, self.tail(processed, self.margin) // block_size)
+
+    def head_blocks(self, h: int, block_size: int) -> int:
+        """Blocks at the start that a hit at h tokens needs (attention sinks)."""
+        return cdiv(min(self.head, h), block_size)
+
+    def max_live_blocks(
+        self, block_size: int, max_in_flight_tokens: int, max_model_len: int
+    ) -> int | None:
+        """Most blocks one request holds at once, or None when unbounded.
+
+        Frees happen on the processed-token basis, so a request holds its law's
+        tail plus the in-flight tokens; a window that does not start on a block
+        boundary spans one more block.
+        """
+        if self.keep_prompt:
+            return None
+        if self.chunk:
+            tokens = min(self.chunk + max_in_flight_tokens, max_model_len)
+            return cdiv(tokens, block_size)
+        tokens = min(self.window + self.margin + max_in_flight_tokens, max_model_len)
+        return cdiv(tokens, block_size) + 1 + cdiv(self.head, block_size)
 
     def first_needed_block(self, h: int, block_size: int) -> int:
         return self.tail(h) // block_size
@@ -95,6 +118,7 @@ def _longest_law_hit(
     block_size: int,
     alignment_tokens: int,
     first_needed_block: Callable[[int], int],
+    head_blocks: Callable[[int], int] = lambda h: 0,
 ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
     """Longest prefix hit for a windowed retention law, as data.
 
@@ -119,13 +143,22 @@ def _longest_law_hit(
         lo = min(first_needed_block(h), hi)
         miss = next((j for j in range(hi - 1, lo - 1, -1) if not lookup(j)), None)
         if miss is None:
+            head = min(head_blocks(h), lo)
+            miss = next((j for j in range(head - 1, -1, -1) if not lookup(j)), None)
+        if miss is None:
             break
         h = miss * block_size // step * step
     hi = h // block_size
     lo = min(first_needed_block(h), hi) if h > 0 else 0
+    head = min(head_blocks(h), lo) if h > 0 else 0
     computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
-        [block_pool.null_block] * lo for _ in kv_cache_group_ids
+        [] for _ in kv_cache_group_ids
     )
+    for j in range(head):
+        for computed, block in zip(computed_blocks, lookup(j)):  # type: ignore[arg-type]
+            computed.append(block)
+    for computed in computed_blocks:
+        computed.extend([block_pool.null_block] * (lo - head))
     for j in range(lo, hi):
         for computed, block in zip(computed_blocks, lookup(j)):  # type: ignore[arg-type]
             computed.append(block)
@@ -201,9 +234,13 @@ class SingleTypeKVCacheManager(ABC):
         Single source of truth for both startup pool sizing
         (`max_allocated_blocks_per_request`) and the runtime admission gate, so requests
         admitted by startup can also be admitted at runtime. `None` means no
-        cap: the request holds every block until it finishes.
+        cap: the request holds every block until it finishes. Read off the
+        manager's retention law when it has one.
         """
-        return None
+        law = cls.retention_law(config)
+        if law is None:
+            return None
+        return law.max_live_blocks(block_size, max_in_flight_tokens, max_model_len)
 
     @classmethod
     def max_allocated_blocks_per_request(
@@ -1185,35 +1222,6 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
 
     @classmethod
-    def max_admission_blocks(
-        cls,
-        config: ManagerConfig,
-        block_size: int,
-        max_in_flight_tokens: int,
-        max_model_len: int,
-    ) -> int | None:
-        # Per-request real-held blocks plateau at this bound because
-        # `remove_skipped_blocks` runs from `allocate_slots` before each chunk's
-        # `get_num_blocks_to_allocate`. During chunked prefill, we hold KV for
-        # the last `sliding_window-1` computed tokens plus the in-flight tokens
-        # (frees happen on the processed-token basis); never more than
-        # `max_model_len`. An additional `extra_retained_tokens` trailing tokens
-        # are kept alive below the window for multi-module spec decoding.
-        params = config.params
-        assert isinstance(params, SlidingWindowManager.Params)
-        num_tokens = min(
-            params.sliding_window
-            - 1
-            + params.extra_retained_tokens
-            + max_in_flight_tokens,
-            max_model_len,
-        )
-        # +1 because the sliding window may not start from the beginning of
-        # the block. E.g. block size 4 and num_token 4 needs two blocks
-        # [XXCD][EF] to store the 6-token window [CDEF].
-        return cdiv(num_tokens, block_size) + 1
-
-    @classmethod
     def max_allocated_blocks_per_request(
         cls,
         config: ManagerConfig,
@@ -1690,22 +1698,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     class Params(SingleTypeKVCacheManager.Params):
         attention_chunk_size: int
 
-    @classmethod
-    def max_admission_blocks(
-        cls,
-        config: ManagerConfig,
-        block_size: int,
-        max_in_flight_tokens: int,
-        max_model_len: int,
-    ) -> int | None:
-        # During chunked prefill, we hold KV for at most one chunk window plus
-        # the in-flight tokens, since frees happen on the processed-token basis.
-        assert isinstance(config.params, ChunkedLocalAttentionManager.Params)
-        num_tokens = min(
-            config.params.attention_chunk_size + max_in_flight_tokens, max_model_len
-        )
-        return cdiv(num_tokens, block_size)
-
     def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
         super().__init__(kv_cache_group, **kwargs)
         assert isinstance(
@@ -1799,6 +1791,67 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
             alignment_tokens,
             first_needed_block=lambda h: law.first_needed_block(h, block_size),
         )
+
+
+class LawWindowManager(SingleTypeKVCacheManager):
+    """A windowed attention kind declared only by its `retention_law`.
+
+    Prefix hits, freeing, skipped tokens and admission bounds all come from
+    the law, so a new windowed kind is its params plus one classmethod.
+    """
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        block_size: int,
+        manager_config: ManagerConfig,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        num_request_tokens: int | None = None,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        assert dcp_world_size == 1 and pcp_world_size == 1
+        block_hashes = resolve_block_hashes(
+            block_hashes,
+            block_pool.hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+            alignment_tokens=alignment_tokens,
+        )
+        law = cls.retention_law(manager_config)
+        assert law is not None, f"{cls.__name__} must declare a retention law"
+        return _longest_law_hit(
+            block_hashes,
+            max_length,
+            kv_cache_group_ids,
+            block_pool,
+            block_size,
+            alignment_tokens,
+            first_needed_block=lambda h: law.first_needed_block(h, block_size),
+            head_blocks=lambda h: law.head_blocks(h, block_size),
+        )
+
+
+class SinkSlidingWindowManager(LawWindowManager):
+    """Attention sinks plus a sliding window (StreamingLLM): each token reads
+    the first `sink_tokens` tokens and the last `sliding_window` tokens.
+    Freeing, skipped tokens, admission bounds and prefix hits all come from
+    the retention law."""
+
+    @dataclass(frozen=True, slots=True)
+    class Params(SingleTypeKVCacheManager.Params):
+        sliding_window: int
+        sink_tokens: int
+
+    @classmethod
+    def retention_law(cls, config: ManagerConfig) -> RetentionLaw:
+        params = config.params
+        assert isinstance(params, SinkSlidingWindowManager.Params)
+        return RetentionLaw(window=params.sliding_window - 1, head=params.sink_tokens)
 
 
 class MambaManager(SingleTypeKVCacheManager):
