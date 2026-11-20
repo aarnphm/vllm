@@ -205,9 +205,16 @@ class StaticSinkAttention(Attention, CustomOp):
         self.sink_key: torch.Tensor | None = None
         self.sink_value: torch.Tensor | None = None
 
-    def update_sink_kv(self, sink_key, sink_value) -> None:
-        self.sink_key = sink_key
-        self.sink_value = sink_value
+    def update_sink_kv(self, sink_key: torch.Tensor, sink_value: torch.Tensor) -> None:
+        """Bind the sink K/V, then refresh them in place on later calls (weight
+        reloads): captured CUDA graphs write the sink from the bound tensors."""
+        if self.sink_key is None or self.sink_value is None:
+            self.sink_key, self.sink_value = sink_key, sink_value
+            return
+        # The bound tensors may be inference tensors from model init.
+        with torch.inference_mode():
+            self.sink_key.copy_(sink_key)
+            self.sink_value.copy_(sink_value)
 
     def forward_native(
         self,
