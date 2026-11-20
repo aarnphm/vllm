@@ -47,6 +47,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
+from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -3809,29 +3810,32 @@ def test_static_sink_layers_in_several_groups_are_refused():
         )
 
 
-def test_static_sink_layers_refuse_decode_context_parallelism():
-    """Each DCP rank keeps the whole sink in its blocks 1..sink_len/block_size,
-    which DCP-scaled scheduler blocks would not reserve. Startup must refuse."""
+def test_static_sink_blocks_stay_out_of_offload_host_pools():
+    """CPU offload builds its host pool from the device KV cache config, sink
+    group included, but the host only holds copies of request blocks. A host
+    pool smaller than the sink must still build and hand out its blocks."""
     block_size = 16
     spec = AttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
-    sink = SinkFullAttentionManager.layer_config(spec, sink_len=4 * block_size)
-    kv_cache_config = KVCacheConfig(
-        num_blocks=11,
-        kv_cache_tensors=[],
-        kv_cache_groups=[new_kv_cache_group(["layer"], sink)],
+    sink = SinkFullAttentionManager.layer_config(spec, sink_len=2 * block_size)
+    host_coordinator = get_kv_cache_coordinator(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=[new_kv_cache_group(["layer"], sink)],
+        ),
+        max_model_len=8192,
+        max_in_flight_tokens=8192,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
     )
 
-    with pytest.raises(ValueError, match="decode context parallelism"):
-        make_kv_cache_manager(
-            kv_cache_config,
-            max_model_len=8192,
-            enable_caching=True,
-            hash_block_size=2 * block_size,
-            scheduler_block_size=2 * block_size,
-            dcp_world_size=2,
-        )
+    assert host_coordinator.block_pool.get_num_free_blocks() == 1
 
 
 def test_prefix_cache_stats_disabled():

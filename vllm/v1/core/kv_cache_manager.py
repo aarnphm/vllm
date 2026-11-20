@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_nul
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
+    first_request_block_id,
     get_kv_cache_kind,
 )
 from vllm.v1.kv_cache_interface import (
@@ -187,6 +188,11 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        # The device pool keeps the blocks a static sink lives in, after the null
+        # block, out of every request. Host pools built for offload hold none.
+        self.block_pool.reserve_blocks(
+            range(1, first_request_block_id(kv_cache_config.kv_cache_groups))
+        )
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers

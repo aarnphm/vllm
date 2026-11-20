@@ -2820,37 +2820,25 @@ class SinkFullAttentionManager(FullAttentionManager):
         assert sink_len > 0 and sink_len % block_size == 0
         return range(1, sink_len // block_size + 1)
 
-    def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
-        super().__init__(kv_cache_group, **kwargs)
-        if self.dcp_world_size > 1:
-            # Every rank keeps the whole sink in its blocks 1..sink_len //
-            # block_size, but DCP-scaled blocks would reserve fewer ids.
-            raise ValueError(
-                "StaticSinkAttention does not support decode context parallelism."
-            )
-        sink_block_ids = self.sink_block_ids(self.manager_config, self.block_size)
-        if any(b.block_id in sink_block_ids for b in self.block_pool.reserved_blocks):
-            # KV cache groups alias the same bytes, so a second sink group would
-            # write its sink KV over the first one's.
-            raise ValueError(
-                "StaticSinkAttention layers must form a single KV cache group, "
-                "but the KV cache config splits them into several (e.g. beside "
-                "a drafter with another attention type)."
-            )
-        self.block_pool.reserve_blocks(sink_block_ids)
-
 
 def first_request_block_id(kv_cache_groups: Iterable[KVCacheGroup]) -> int:
     """The lowest block id a request can own: block 0 is the null block, and a
-    static sink group keeps the blocks after it for the engine's lifetime."""
-    return max(
-        (
-            SinkFullAttentionManager.sink_block_ids(g.manager_config, g.block_size).stop
-            for g in kv_cache_groups
-            if issubclass(g.manager_config.manager_cls, SinkFullAttentionManager)
-        ),
-        default=1,
-    )
+    static sink group keeps the blocks after it, in the group's resolved block
+    size, for the engine's lifetime."""
+    sink_block_ids = [
+        SinkFullAttentionManager.sink_block_ids(g.manager_config, g.block_size)
+        for g in kv_cache_groups
+        if issubclass(g.manager_config.manager_cls, SinkFullAttentionManager)
+    ]
+    if len(sink_block_ids) > 1:
+        # KV cache groups alias the same bytes, so a second sink group would
+        # write its sink KV over the first one's.
+        raise ValueError(
+            "StaticSinkAttention layers must form a single KV cache group, "
+            "but the KV cache config splits them into several (e.g. beside "
+            "a drafter with another attention type)."
+        )
+    return sink_block_ids[0].stop if sink_block_ids else 1
 
 
 class HiSparseSourceManager(FullAttentionManager):
