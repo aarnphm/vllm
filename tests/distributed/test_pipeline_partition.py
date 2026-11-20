@@ -41,6 +41,14 @@ def test_custom_layer_partition(monkeypatch: pytest.MonkeyPatch):
         # Negative layer count
         with pytest.raises(ValueError):
             _verify("-1,5", 4, 2, [(0, -1), (-1, 4)])
+        # A stage without layers, which the KV cache planner cannot size
+        with pytest.raises(ValueError, match="at least one layer"):
+            _verify("4,0", 4, 2, [(0, 4), (4, 4)])
+
+
+def test_auto_partition_gives_every_stage_a_layer():
+    with pytest.raises(ValueError, match="at least one layer"):
+        get_pp_indices(2, 0, 4)
 
 
 @pytest.mark.parametrize(
