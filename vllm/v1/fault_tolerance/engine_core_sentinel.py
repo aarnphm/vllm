@@ -4,6 +4,7 @@
 
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -40,6 +41,7 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.serial_utils import UtilityResult, run_method
 
 if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 
 logger = init_logger(__name__)
@@ -232,7 +234,9 @@ class EngineCoreSentinel:
         """Evict KV blocks possibly contaminated by the failed step."""
         scheduler = cast(Scheduler, self.engine.scheduler)
         kv_cache_manager = scheduler.kv_cache_manager
-        dirty_block_ids: set[int] = set()
+        # Block IDs index the pool of the manager that allocated them; a
+        # host-resident group (HiSparse) has its own pool and ID space.
+        dirty_block_ids: defaultdict[BlockPool, set[int]] = defaultdict(set)
 
         for request in scheduler.running:
             num_written = request.num_in_flight_tokens
@@ -249,10 +253,10 @@ class EngineCoreSentinel:
                 blk_end = end // mgr.block_size
                 for blk in blocks[blk_start : blk_end + 1]:
                     if not blk.is_null:
-                        dirty_block_ids.add(blk.block_id)
+                        dirty_block_ids[mgr.block_pool].add(blk.block_id)
 
-        if dirty_block_ids:
-            kv_cache_manager.evict_blocks(dirty_block_ids)
+        for block_pool, block_ids in dirty_block_ids.items():
+            block_pool.evict_blocks(block_ids)
 
     def _install_executor_failure_callback(self) -> None:
         """Report executor failure to the sentinel as well.
