@@ -707,20 +707,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 export_handle_types=kv_cache_export_handle_types(self.vllm_config),
             )
 
-        block_table_max_model_len = self.max_model_len
-        if self.is_encoder_decoder:
-            # Cross-attention block tables need to index encoder tokens, which
-            # can exceed the decoder's max_model_len.
-            block_table_max_model_len = max(
-                block_table_max_model_len,
-                self.scheduler_config.max_num_encoder_input_tokens,
-                getattr(self.model_config.hf_config, "max_source_positions", 0),
-            )
-
         kv_cache_groups = kv_cache_config.kv_cache_groups
         max_num_blocks_per_group = [
-            g.block_table_width(self.vllm_config, block_table_max_model_len)
-            for g in kv_cache_groups
+            g.block_table_width(self.vllm_config) for g in kv_cache_groups
         ]
 
         target_attn_layer_names = None

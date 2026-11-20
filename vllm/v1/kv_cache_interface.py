@@ -283,6 +283,21 @@ def get_block_table_width(
     return max_num_blocks
 
 
+def get_block_table_max_len(vllm_config: VllmConfig) -> int:
+    """The tokens a worker-side block table row indexes: `max_model_len`, or
+    for encoder-decoder models the encoder length when it is longer, because
+    cross-attention block tables index encoder tokens."""
+    model_config = vllm_config.model_config
+    max_len = model_config.max_model_len
+    if model_config.is_encoder_decoder:
+        max_len = max(
+            max_len,
+            vllm_config.scheduler_config.max_num_encoder_input_tokens,
+            getattr(model_config.hf_config, "max_source_positions", 0),
+        )
+    return max_len
+
+
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
     """View a kernel-block-granular layer cache with manager blocks as dim 0.
 
@@ -778,17 +793,21 @@ class KVCacheGroup:
         self, vllm_config: VllmConfig, max_len: int | None = None
     ) -> int:
         """The row length of the worker-side block table for this group, sized
-        for `max_len` tokens (default: `max_model_len`)."""
+        for `max_len` tokens (default: `get_block_table_max_len`)."""
         if max_len is None:
-            max_len = vllm_config.model_config.max_model_len
+            max_len = get_block_table_max_len(vllm_config)
         return self.manager_cls.max_num_blocks_per_req(
             self.manager_config, self.block_size, self.dcp_sharded, vllm_config, max_len
         )
 
-    def block_table_width(self, vllm_config: VllmConfig, max_len: int) -> int:
+    def block_table_width(
+        self, vllm_config: VllmConfig, max_len: int | None = None
+    ) -> int:
         """`max_num_blocks_per_req` (which accounts for DCP sharding: attention
         KV is sharded, recurrent state replicated) padded to the manager's
-        block-table token alignment."""
+        block-table token alignment. The runner sizes the group's block table
+        rows with it, and attention groups size their kernel block tables from
+        it."""
         return get_block_table_width(
             self.max_num_blocks_per_req(vllm_config, max_len),
             self.block_size,

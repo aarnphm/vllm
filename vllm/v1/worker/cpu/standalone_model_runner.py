@@ -362,14 +362,6 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
-        block_table_max_model_len = self.max_model_len
-        if self.is_encoder_decoder:
-            block_table_max_model_len = max(
-                block_table_max_model_len,
-                self.scheduler_config.max_num_encoder_input_tokens,
-                getattr(self.model_config.hf_config, "max_source_positions", 0),
-            )
-
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
@@ -379,9 +371,7 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             slot_mapping_enabled.append(kv_cache_group.uses_slot_mapping)
             sliding_window_reach.append(kv_cache_group.sliding_window_reach)
             max_num_blocks_per_group.append(
-                kv_cache_group.block_table_width(
-                    self.vllm_config, block_table_max_model_len
-                )
+                kv_cache_group.block_table_width(self.vllm_config)
             )
 
         with self.jit_warmup_registry.activate():

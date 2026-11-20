@@ -38,7 +38,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     create_kv_cache_views,
-    get_block_table_width,
 )
 
 logger = init_logger(__name__)
@@ -308,8 +307,7 @@ class AttentionGroup:
         builder_kwargs = {}
         if builder_cls.requires_block_table_width or self.kernel_block_size is not None:
             assert kv_cache_group is not None
-            max_num_blocks = kv_cache_group.max_num_blocks_per_req(vllm_config)
-            width = get_block_table_width(max_num_blocks, self.kv_cache_spec.block_size)
+            width = kv_cache_group.block_table_width(vllm_config)
             if kernel_block_size is not None:
                 width *= self.kv_cache_spec.block_size // kernel_block_size
             if builder_cls.requires_block_table_width:

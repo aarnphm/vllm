@@ -404,7 +404,7 @@ def test_no_attn_metadata_layers_keep_their_layout_without_builders(monkeypatch)
     )
     vllm_config: Any = SimpleNamespace(
         cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
-        model_config=SimpleNamespace(max_model_len=1024),
+        model_config=SimpleNamespace(max_model_len=1024, is_encoder_decoder=False),
         scheduler_config=SimpleNamespace(max_num_seqs=2),
         parallel_config=SimpleNamespace(
             use_ubatching=False, decode_context_parallel_size=1
@@ -1273,7 +1273,7 @@ class _TableBuilder:
 
 
 _VLLM_CONFIG = SimpleNamespace(
-    model_config=SimpleNamespace(max_model_len=8192),
+    model_config=SimpleNamespace(max_model_len=8192, is_encoder_decoder=False),
     scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=16),
     parallel_config=SimpleNamespace(decode_context_parallel_size=1),
 )

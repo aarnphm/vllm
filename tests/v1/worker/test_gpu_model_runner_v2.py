@@ -12,11 +12,13 @@ import pytest
 import torch
 
 import vllm.distributed.aux_output_connector.worker as aux_output_worker
+import vllm.v1.worker.gpu.attn_utils as attn_utils_module
 import vllm.v1.worker.gpu.model_runner as model_runner_module
 from tests.v1.core.utils import new_kv_cache_group
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    DeviceConfig,
     KernelConfig,
     LoadConfig,
     LoRAConfig,
@@ -28,10 +30,12 @@ from vllm.config import (
 )
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
+    CrossAttentionManager,
     MambaManager,
 )
 from vllm.v1.kv_cache_interface import (
@@ -306,6 +310,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     )
     runner.parallel_config = parallel_config
     runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=runner.max_model_len, is_encoder_decoder=False
+        ),
         parallel_config=parallel_config,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
     )
@@ -421,6 +428,9 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
         cp_kv_cache_interleave_size=1,
     )
     vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len, is_encoder_decoder=False
+        ),
         parallel_config=parallel_config,
         cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
     )
@@ -452,6 +462,127 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
     # Attention KV is local to one of eight DCP ranks; KDA state is replicated
     # and therefore needs one table entry for every global 16-token page.
     assert captured == [86, expected]
+
+
+def test_encoder_decoder_kernel_block_tables_cover_block_table_rows(monkeypatch):
+    """Whisper's block tables index its 1500 encoder positions, past the 448-token
+    decoder max_model_len. A backend that splits the manager's blocks into kernel
+    blocks must still get the runner's whole block-table row on the first build."""
+    block_size, kernel_block_size = 64, 16
+    model_config = ModelConfig("openai/whisper-tiny")
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        device_config=DeviceConfig(device="cpu"),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=model_config.max_model_len,
+            max_model_len=model_config.max_model_len,
+            is_encoder_decoder=True,
+        ),
+    )
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+    layer_names = ["decoder.self_attn", "decoder.encoder_attn"]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group([layer_names[0]], spec),
+            new_kv_cache_group(
+                [layer_names[1]], CrossAttentionManager.layer_config(spec)
+            ),
+        ],
+    )
+
+    class Builder:
+        requires_block_table_width = False
+        supports_update_block_table = False
+
+        def __init__(self, *_args):
+            pass
+
+        def get_cudagraph_support(self, *_args):
+            return AttentionCGSupport.ALWAYS
+
+        def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
+            return common_attn_metadata.block_table_tensor
+
+    backend = SimpleNamespace(
+        full_cls_name=lambda: (__name__, "FixedKernelBlocks"),
+        get_supported_kernel_block_sizes_for_layers=lambda *_: [kernel_block_size],
+        get_builder_cls=lambda: Builder,
+    )
+    layer = SimpleNamespace(get_attn_backend=lambda: backend)
+    monkeypatch.setattr(
+        attn_utils_module,
+        "get_layers_from_vllm_config",
+        lambda _config, _type, names=(): dict.fromkeys(names, layer),
+    )
+
+    class BlockTablesCaptured(Exception):
+        pass
+
+    captured = {}
+
+    def capture_block_tables(**kwargs):
+        captured.update(kwargs)
+        raise BlockTablesCaptured
+
+    monkeypatch.setattr(model_runner_module, "BlockTables", capture_block_tables)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = vllm_config
+    runner.model_config = vllm_config.model_config
+    runner.scheduler_config = vllm_config.scheduler_config
+    runner.parallel_config = vllm_config.parallel_config
+    runner.max_model_len = model_config.max_model_len
+    runner.is_encoder_decoder = model_config.is_encoder_decoder
+    runner.device = torch.device("cpu")
+    runner.jit_warmup_registry = JitWarmupRegistry(vllm_config)
+    runner.model_state = SimpleNamespace(
+        get_additional_cg_support=lambda: (AttentionCGSupport.ALWAYS, None),
+        num_new_sampled_tokens_per_step=1,
+    )
+    runner.speculator = None
+    runner.batch_sharder = None
+    runner.req_states = None
+    runner.input_buffers = SimpleNamespace(query_start_loc=None)
+    runner.vocab_size = model_config.get_vocab_size()
+    runner.max_num_reqs = runner.max_num_tokens = 2
+    runner.dcp_size, runner.dcp_rank = 1, 0
+
+    with pytest.raises(BlockTablesCaptured):
+        runner.initialize_kv_cache(kv_cache_config)
+
+    widths = captured["max_num_blocks_per_group"]
+    assert widths[1] * block_size >= model_config.hf_config.max_source_positions
+    num_reqs = runner.max_num_reqs
+    block_tables = [
+        torch.arange(num_reqs * width, dtype=torch.int32).view(num_reqs, width)
+        for width in widths
+    ]
+    query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32)
+    attn_metadata = attn_utils_module.build_attn_metadata(
+        runner.attn_groups,
+        num_reqs=num_reqs,
+        num_tokens=num_reqs,
+        query_start_loc_gpu=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        max_query_len=1,
+        seq_lens=torch.ones(num_reqs, dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=block_tables,
+        slot_mappings=torch.zeros(len(widths), num_reqs, dtype=torch.int64),
+        kv_cache_config=runner.kv_cache_config,
+    )
+
+    # Manager block b holds kernel blocks 4b..4b+3, for every column of the row.
+    ratio = block_size // kernel_block_size
+    for layer_name, block_table in zip(layer_names, block_tables):
+        offsets = torch.arange(ratio, dtype=torch.int32)
+        expected = (block_table.unsqueeze(-1) * ratio + offsets).flatten(1)
+        assert torch.equal(attn_metadata[layer_name], expected)
 
 
 def test_append_block_ids_rejects_write_past_row_capacity():
