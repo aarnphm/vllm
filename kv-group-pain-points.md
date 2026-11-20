@@ -255,9 +255,15 @@ Of 26 items: 14 are fixed on branches, 9 already have open upstream fixes, 1 nee
 | 24    | fixed | `chunked-local-vbatch` `45a0d8f63a`, `161e567dc4` (FA3) | GPU: at base the native path crashes and the SM100 default computes wrong prefill KV offsets; the fix is exact. FlexAttention is left to #68142 |
 | NUMA  | upstream | #67855 (issue #67851) | CPU repro of the thread race |
 | K3 fp8 | fixed | `k3-fp8-prefill-check` `ace4a7aae9` | GPU, TP4: base fails after 580 s in warmup; the fix refuses in 38 s and names both settings; the recipe still generates |
-| Mamba2 index | upstream | #58851 (needs rebase), #65182 (full builds only) | GPU kernel check: byte-identical in 120 cases |
+| Mamba2 index | upstream | #58851 (needs rebase), #65182 (full builds only) | GPU kernel check: byte-identical in 120 cases. A/B on GB300, TP4, graphs on: a Mamba2 reuse drops from 91 to 45 µs; host `execute_model` p50 drops 15-17% on Granite-4-H-small and 9-10% on Nemotron-Nano-9B-v2 |
 
 Bug 15 keeps its open fix (#68103). Bug 21 (ROCm gfx1250) was not attempted.
+
+A second, skeptical pass (2026-11-20, evening, base `e82b7fca7e`) checked 15 leftover findings from earlier reviews and the fix agents' side notes. Each one needed a CPU repro through the real code path before it could count. Results:
+- 1 false positive: DCP with a sliding-window group cannot start.
+- 3 duplicates of open PRs: #56585, #49965 and #51448.
+- 3 need a design change: the sentinel publishing a dirty spill after a failed step, and two P/D metadata checks.
+- 8 real, all now fixed. Three are correctness fixes, pushed: the static-sink builder no longer writes the batch `seq_lens` (it made the sampler emit a token mid-prompt), empty PP stages are refused, and the sink K/V survive a weight reload in place. They are on `aarnphm/sink-sentinel-followups` and `aarnphm/sink-block-reservation`. Five more are held back for responsible disclosure.
 
 ## Where it breaks in practice
 

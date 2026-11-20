@@ -1,6 +1,6 @@
 # KV cache group study: notes and fix branches
 
-This branch holds notes only. They come from a study of vLLM's KV cache group machinery at upstream `d33bfeef40` (2026-11-19) and from the fixes that followed, based on upstream `e2bab26e51` (2026-11-20). Each fix is its own branch in this fork. No PR is open yet.
+This branch holds notes only. They come from a study of vLLM's KV cache group machinery at upstream `d33bfeef40` (2026-11-19) and from the fixes that followed, based on upstream `e2bab26e51` (2026-11-20). Each fix is its own branch in this fork. No PR is open yet. A second pass on 2026-11-20 checked the leftover findings; its summary is at the end of "Fix status" in `kv-group-pain-points.md`.
 
 - `kv-group-pain-points.md`: the study. It covers the root causes, the bugs found, numbers from the real planner, the GPU checks and the fix status table.
 - `fixes/<branch>/PR.md`: the draft PR description for branch `aarnphm/<branch>`. `STATUS.md`, where present, has the test commands and their result lines.
@@ -8,7 +8,7 @@ This branch holds notes only. They come from a study of vLLM's KV cache group ma
 
 | Branch | Bug | Diff |
 | --- | --- | --- |
-| `aarnphm/sink-block-reservation` | 2: static-sink blocks reused as request KV; the sink writer's view layout | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/sink-block-reservation) |
+| `aarnphm/sink-block-reservation` | 2: static-sink blocks reused as request KV; the sink writer's view layout; sink K/V kept in place across weight reloads | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/sink-block-reservation) |
 | `aarnphm/nixl-conv-spec-mismatch` | 3: P/D conv state offsets with different draft lengths | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/nixl-conv-spec-mismatch) |
 | `aarnphm/mooncake-mamba-slots` | 4: Mooncake Mamba state slot pairing | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/mooncake-mamba-slots) |
 | `aarnphm/worker-null-masking` | 5, 22: freed R-SWA and PCP window blocks read by attention | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/worker-null-masking) |
@@ -22,6 +22,7 @@ This branch holds notes only. They come from a study of vLLM's KV cache group ma
 | `aarnphm/sentinel-pool-ids` | 23: fault sentinel evicts host ids from the device pool | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/sentinel-pool-ids) |
 | `aarnphm/chunked-local-vbatch` | 24: chunked-local virtual batches overflow FlashInfer and FA3 buffers | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/chunked-local-vbatch) |
 | `aarnphm/k3-fp8-prefill-check` | Kimi-K3 fp8 KV cache without an fp8 prefill query, refused at startup | [compare](https://github.com/aarnphm/vllm/compare/e2bab26e51...aarnphm/k3-fp8-prefill-check) |
+| `aarnphm/sink-sentinel-followups` (base `e82b7fca7e`) | the static-sink builder wrote the batch `seq_lens` (a token emitted mid-prompt); pipeline stages with zero layers | [compare](https://github.com/aarnphm/vllm/compare/e82b7fca7e...aarnphm/sink-sentinel-followups) |
 
 These open upstream PRs already fix other bugs from the study and need a rebase or a review: #57358 (bugs 1, 7), #49965 (8), #60045 and #66725 (9), #65690 (10), #63691 (11), #54599 (17), #67855 (NUMA binding race), #58851 (Mamba2 aligned state indices).
 

@@ -39,7 +39,8 @@ The output is wrong in every case, and nothing errors.
 
 Why every step rather than only after a remap: a remap-only write needs hooks at the end of startup, `extend_kv_cache`, wake/restore and every weight-update path. It also can't run inside decode replays of graphs captured without it. The every-step write costs one `reshape_and_cache` of `sink_len` tokens per sink layer per step: 27 layers (28 with MTP) × 128 tokens on R-7B, about 16 MB of writes. I haven't measured it yet.
 
-_Note that_ a weight reload that replaces the sink K tensor, rather than updating it in place, leaves captured graphs writing the old tensor (`post_weight_load` builds `k_layernorm(param_sink_key)` anew). That needs an in-place refresh or a recapture; it is a follow-up.
+- **Weight reload:** captured graphs write the sink from the K/V tensors bound at capture. OpenPangu's `post_weight_load` builds a new normalized K on every load, so `update_sink_kv` now binds the tensors once and copies later values into them. Their addresses stay put.
+- **The batch `seq_lens` stays untouched.** The builder used to add the sink length in place to `common_attn_metadata.seq_lens`, which is a view of the step's batch `seq_lens`. The sampler's chunked-prefill check then saw `seq_len + sink_len`, so a prefill chunk ending fewer than `sink_len` tokens before the end of its prompt counted as finished and returned a mid-prompt token. The rejection sampler, the drafters and later KV cache groups read the same tensor. The builder now keeps the sink lengths in a buffer of its own and hands the underlying builder a replaced `CommonAttentionMetadata`.
 
 ### Validation
 
@@ -61,7 +62,7 @@ At 82966074ba (this PR's second commit):
 - `test_sink_read_ids_are_the_blocks_the_device_pool_keeps`: `E assert [1, 2] == [1]`. The group resolved to 32-token blocks while `CacheConfig.block_size` is 16.
 - `test_decode_context_parallelism_is_refused_when_the_model_is_built`: the layer didn't refuse, so construction went on into backend selection.
 
-This PR: all pass. The layer test file gives `2 passed, 2 skipped`, the skips being the GPU test off CUDA.
+This PR: all pass. The layer test file gives `3 passed, 2 skipped`, the skips being the GPU test off CUDA.
 
 I also ran the allocation test against a variant that only restores the old pop. It hands out the right blocks but fails on accounting: `assert 0.19999999999999996 == 0.0` on `manager.usage`.
 
@@ -74,7 +75,11 @@ pytest -q tests/v1/worker/test_gpu_warmup_blocks.py   # CUDA-gated; I ran it wit
 
 The plugin passes the file's `is_cuda_alike()` gate and turns `torch.accelerator.synchronize()` into a no-op; the tests drive warmup through a stub runner.
 
-Existing tests on the reset, usage, warmup-capacity and bench paths, with the new ones: `3 failed, 23 passed`. The 3 failures are `test_scheduler.py` reset tests with `RuntimeError: Failed to infer device type` on macOS; they fail the same way on e2bab26e51.
+The last two commits add two tests:
+- `test_static_sink_builder_keeps_batch_seq_lens` (`tests/v1/worker/test_attn_utils.py`) builds a sink group and a full group through `build_attn_metadata`. On the parent commit the batch `seq_lens` becomes `[53, 116, 0]` instead of `[37, 100, 0]`. With the fix it is unchanged; the sink builder sees the sink lengths and the other group the true ones. The whole file gives `71 passed, 11 skipped`.
+- `test_weight_reload_refreshes_the_sink_tensors_in_place` fails on its parent commit, where the sink K address changes after a second `update_sink_kv`.
+
+Existing tests on the reset, usage, warmup-capacity and bench paths, run with the new ones under a local plugin that makes macOS look like vLLM's CPU platform: `27 passed`.
 
 `pre-commit run --files` on every changed file passes, mypy and the CI-tethering check included.
 
