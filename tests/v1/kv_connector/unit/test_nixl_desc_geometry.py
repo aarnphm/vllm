@@ -1813,11 +1813,20 @@ def test_csa_linear_ple_descriptor_is_not_split():
         head_windows={r: HeadWindow(0, 0, 1) for r in (0, 1)},
         local_heads=1,
     )
+    # P at TP2 holds half of this TP1 rank's state on each rank.
+    conv_bytes, ssm_bytes = worker._mamba_ssm_size
+    ssm_windows = {
+        p: worker._conv_decomp.read_windows(
+            (conv_bytes // 2, ssm_bytes // 2), 1, 0, 2, p
+        )
+        for p in (0, 1)
+    }
     splits = list(
         worker._build_local_splits_from_plan(
             mapping,
             np.concatenate([attention, mamba]),
             num_fa_descs=int(attention[:, 4].sum()),
+            ssm_windows=ssm_windows,
         )
     )
     assert len(splits) == 2
@@ -1860,9 +1869,12 @@ def test_csa_linear_remote_ple_is_copied_whole():
         attn_backend_name="test",
         physical_blocks_per_logical_kv_block=1,
     )
+    # The peer runs at twice this rank's TP; read from its rank 0.
+    remote_tp_size = 2 * worker.transfer_topo.tp_size
     descriptors = worker._build_mamba_remote(
         metadata,
-        tp_ratio=-2,
+        remote_tp_size=remote_tp_size,
+        remote_tp_rank=0,
         transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
         pairs=pairs,
     )
@@ -1874,7 +1886,8 @@ def test_csa_linear_remote_ple_is_copied_whole():
     with pytest.raises(ValueError, match="PLE pages require identical"):
         worker._build_mamba_remote(
             metadata,
-            tp_ratio=-2,
+            remote_tp_size=remote_tp_size,
+            remote_tp_rank=0,
             transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
             pairs=pairs,
         )
@@ -2361,7 +2374,11 @@ _LAYOUT_PREFERENCE = ["LBNHC", "LBHNC", "BLNHC", "BLHNC", "BHLNC", "LHBNC"]
 
 
 def _real_model_side(model, layout):
-    """Plan and allocate one side's KV caches the way the engine does, with
+    return _plan_side(*_REAL_MODELS[model], layout)
+
+
+def _plan_side(block_size, layers, layout, tp_size=1, total_kv_heads=None):
+    """Plan and allocate one rank's KV caches the way the engine does, with
     just enough blocks for one request of one or two blocks per group."""
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
     from vllm.v1.core.kv_cache_planning import (
@@ -2370,10 +2387,12 @@ def _real_model_side(model, layout):
     )
     from vllm.v1.worker.utils import allocate_kv_cache
 
-    block_size, layers = _REAL_MODELS[model]
     vllm_config = create_vllm_config(
         block_size=block_size, max_model_len=block_size, kv_role="kv_both"
     )
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+    if total_kv_heads is not None:
+        vllm_config.model_config.model_arch_config.total_num_kv_heads = total_kv_heads
     vllm_config.model_config.max_model_len = block_size
     vllm_config.cache_config.enable_prefix_caching = False
     vllm_config.cache_config.kv_cache_layout = layout
@@ -2413,7 +2432,7 @@ def _blocks_per_request(group):
     return 1 if issubclass(group.manager_cls, MambaManager) else 2
 
 
-def _real_model_worker(engine_id, vllm_config, kv_cache_config, caches):
+def _real_model_worker(engine_id, vllm_config, kv_cache_config, caches, tp_rank=0):
     from vllm.config import set_current_vllm_config
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
@@ -2432,8 +2451,12 @@ def _real_model_worker(engine_id, vllm_config, kv_cache_config, caches):
     fake_platform.get_nixl_memory_type.return_value = "VRAM"
     with (
         patch.object(bw, "NixlWrapper", _RecordingNixl),
-        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
-        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=tp_rank),
+        patch.object(
+            bw,
+            "get_tensor_model_parallel_world_size",
+            return_value=vllm_config.parallel_config.tensor_parallel_size,
+        ),
         patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
         patch.object(bw, "select_common_block_size", lambda size, *_: size),
         patch.object(bw, "current_platform", fake_platform),
@@ -2560,6 +2583,155 @@ def test_real_model_layout_pull_copies_every_page(model, p_layout, d_layout):
     for t in storages.values():
         raw = torch.empty(0, dtype=torch.uint8).set_(t.untyped_storage())
         assert not raw.any(), "D bytes outside the request's pages changed"
+
+
+# A Mamba2 + MQA hybrid shaped like granite-4.0-h, scaled down: 8 heads of
+# 4 channels, 8-dim SSM state, conv kernel 4, one KV head.
+_M2_HEADS, _M2_HEAD_DIM, _M2_STATE = 8, 4, 8
+
+
+def _mamba2_hybrid_layers(tp_size, n_groups):
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateShapeCalculator,
+    )
+
+    with patch(
+        "vllm.model_executor.layers.mamba.mamba_utils.get_conv_state_layout",
+        return_value="DS",
+    ):
+        shapes = MambaStateShapeCalculator.mamba2_state_shape(
+            tp_world_size=tp_size,
+            intermediate_size=_M2_HEADS * _M2_HEAD_DIM,
+            n_groups=n_groups,
+            num_heads=_M2_HEADS,
+            head_dim=_M2_HEAD_DIM,
+            state_size=_M2_STATE,
+            conv_kernel=4,
+        )
+    mamba2 = _mamba(shapes, MambaAttentionBackendEnum.MAMBA2)
+    return [(f"model.layers.{i}.mixer", mamba2) for i in range(2)] + [
+        ("model.layers.2.self_attn.attn", _attn(1, 32))
+    ]
+
+
+def _mamba2_shard(conv, ssm, tp_size, tp_rank, n_groups):
+    """One rank's slice of a global Mamba2 state, as MambaMixer2 shards it:
+    x and the heads in TP order, B and C by group, and every rank taking the
+    one group whole when n_groups == 1 (`mamba_v2_sharded_weight_loader`)."""
+    x, b, c = conv.split(
+        [_M2_HEADS * _M2_HEAD_DIM, n_groups * _M2_STATE, n_groups * _M2_STATE]
+    )
+    heads = _M2_HEADS // tp_size
+    groups = 1 if n_groups == 1 else n_groups // tp_size
+    first_group = 0 if n_groups == 1 else tp_rank * groups
+    x_cols = slice(tp_rank * heads * _M2_HEAD_DIM, (tp_rank + 1) * heads * _M2_HEAD_DIM)
+    g_cols = slice(first_group * _M2_STATE, (first_group + groups) * _M2_STATE)
+    return (
+        torch.cat([x[x_cols], b[g_cols], c[g_cols]]),
+        ssm[tp_rank * heads : (tp_rank + 1) * heads],
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("n_groups", [1, 2])
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1)])
+def test_mamba2_hetero_tp_pull_gives_each_rank_its_own_state(n_groups, p_tp, d_tp):
+    """Issue #61526: D pulls a Mamba2 hybrid request from P at another TP
+    size. Every D rank must end with the conv state (x, B, C) and temporal
+    state it would hold itself. With n_groups == 1 every rank holds the one
+    group whole, so B and C must not be split by the TP ratio."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    def side(engine_id, tp_size):
+        layers = _mamba2_hybrid_layers(tp_size, n_groups)
+        ranks = []
+        for rank in range(tp_size):
+            config, kv_config, caches = _plan_side(
+                16, layers, "LBHNC", tp_size=tp_size, total_kv_heads=1
+            )
+            worker = _real_model_worker(engine_id, config, kv_config, caches, rank)
+            ranks.append((worker, kv_config, caches))
+        return ranks
+
+    p_ranks, d_ranks = side("P", p_tp), side("D", d_tp)
+    groups = d_ranks[0][1].transfer_groups
+    num_blocks = d_ranks[0][1].num_blocks
+    p_ids = [[1 + i] for i in range(len(groups))]
+    d_ids = [[num_blocks - 1 - i] for i in range(len(groups))]
+    conv_cols = _M2_HEADS * _M2_HEAD_DIM + 2 * n_groups * _M2_STATE
+    ssm_shape = (_M2_HEADS, _M2_HEAD_DIM, _M2_STATE)
+    truth = {
+        name: (
+            _tag(torch.empty(conv_cols, 3, dtype=_BF16), name, "conv"),
+            _tag(torch.empty(ssm_shape, dtype=torch.float32), name, "ssm"),
+        )
+        for g in groups
+        for name in g.layer_names
+        if name.endswith("mixer")
+    }
+
+    def expected(name, page, tp_size, rank):
+        """The bytes a rank's page starts with: a Mamba page holds the conv
+        state, then the temporal state; one KV head is the same everywhere."""
+        if name not in truth:
+            return _tag(page, name).view(-1)
+        shard = _mamba2_shard(*truth[name], tp_size, rank, n_groups)
+        return torch.cat([t.contiguous().view(-1).view(torch.int8) for t in shard])
+
+    def page_of(caches, name, block):
+        (page,) = _cache_pages(caches[name], block)
+        return page.view(-1)
+
+    for rank, (_, _, caches) in enumerate(p_ranks):
+        for g, ids in zip(groups, p_ids):
+            for name in g.layer_names:
+                page = page_of(caches, name, ids[0])
+                want = expected(name, page, p_tp, rank)
+                page[: want.numel()].copy_(want)
+
+    metas = [
+        msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+            p.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        for p, _, _ in p_ranks
+    ]
+    for rank, (d, _, caches) in enumerate(d_ranks):
+        # The handshake reaches only the P ranks this rank reads from.
+        d._remote_agents["P"] = {
+            (0, p): d.add_remote_agent(metas[p], remote_tp_rank=p, remote_tp_size=p_tp)
+            for p in d.transfer_topo.handshake_target_ranks(p_tp)
+        }
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req_to_recv(
+            request_id="req",
+            local_block_ids=tuple(d_ids),
+            kv_transfer_params={
+                "remote_block_ids": p_ids,
+                "remote_engine_id": "P",
+                "remote_request_id": "prefill-req",
+                "remote_host": "remote-host",
+                "remote_port": 1234,
+                "tp_size": p_tp,
+            },
+        )
+        req = metadata.reqs_to_recv["req"]
+        req.local_physical_block_ids = d._logical_to_kernel_block_ids(
+            req.local_block_ids, d._physical_blocks_per_logical_kv_block
+        )
+        d._recving_metadata["req"] = req
+        d._read_blocks_for_req("req", req)
+        _run_recorded_copies(d.nixl_wrapper)
+
+        wrong = []
+        for g, ids in zip(groups, d_ids):
+            for name in g.layer_names:
+                page = page_of(caches, name, ids[0])
+                want = expected(name, page, d_tp, rank)
+                if not torch.equal(page[: want.numel()], want):
+                    wrong.append(f"D rank {rank}: {name}")
+        assert not wrong, wrong
 
 
 _PP_TARGET_LAYERS = [f"model.layers.{i}.self_attn.attn" for i in range(4)]

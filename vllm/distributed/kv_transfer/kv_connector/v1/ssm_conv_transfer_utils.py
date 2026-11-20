@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.utils import head_window
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -42,6 +43,10 @@ class MambaConvSplitInfo:
     local_proj_dims: tuple[int, ...]
     conv_dtype_size: int  # bytes per element (e.g. 2 for float16)
     ssm_sizes: tuple[int, int]  # (conv_state_bytes, ssm_state_bytes)
+    # Columns of one group, per sub-projection, for those TP can replicate:
+    # Mamba2's B and C hold n_groups groups, and with fewer groups than
+    # ranks every rank holds one whole group. None where TP always divides.
+    proj_group_dims: tuple[int | None, ...] | None = None
 
     @property
     def local_conv_dim(self) -> int:
@@ -103,6 +108,70 @@ class MambaConvSplitInfo:
                 remote_base += remote_size
         return offsets
 
+    def read_windows(
+        self,
+        remote_ssm_sizes: tuple[int, int],
+        tp_size: int,
+        tp_rank: int,
+        remote_tp_size: int,
+        remote_rank: int,
+    ) -> list[tuple[int, int, int]]:
+        """(local offset, remote offset, length) in bytes within one page,
+        for each conv sub-projection and then the temporal state: the part
+        of the state this rank shares with `remote_rank`.
+
+        TP gives each rank a contiguous range of a sub-projection, or one
+        replicated group once there are fewer groups than ranks
+        (`head_slice`). Divided sub-projections and the temporal state are
+        split in proportion to their bytes. A replicable sub-projection's
+        remote size is the remote conv bytes the divided ones leave, and its
+        group count is min(local groups * tp, remote groups * remote tp):
+        exact unless both sides replicate, where every rank holds the same
+        group anyway.
+        """
+        row_bytes = self.conv_rows * self.conv_dtype_size
+        groups = self.proj_group_dims or (None,) * len(self.local_proj_dims)
+        local_sizes = [dim * row_bytes for dim in self.local_proj_dims]
+        remote_sizes = [
+            size * tp_size // remote_tp_size if group is None else 0
+            for size, group in zip(local_sizes, groups)
+        ]
+        if num_replicable := sum(group is not None for group in groups):
+            rest = remote_ssm_sizes[0] - sum(remote_sizes)
+            assert rest > 0 and rest % (num_replicable * row_bytes) == 0, (
+                f"Remote conv state ({remote_ssm_sizes[0]} B) does not split "
+                f"into sub-projections like the local one ({self.local_proj_dims})."
+            )
+            remote_sizes = [
+                rest // num_replicable if group is not None else size
+                for size, group in zip(remote_sizes, groups)
+            ]
+
+        windows: list[tuple[int, int, int]] = []
+        local_base = remote_base = 0
+        for local_size, remote_size, group in zip(local_sizes, remote_sizes, groups):
+            unit = 1 if group is None else group * row_bytes
+            total = min(
+                local_size // unit * tp_size, remote_size // unit * remote_tp_size
+            )
+            w = head_window(total, tp_size, tp_rank, remote_tp_size, remote_rank)
+            windows.append(
+                (
+                    local_base + w.local * unit,
+                    remote_base + w.remote * unit,
+                    w.count * unit,
+                )
+            )
+            local_base += local_size
+            remote_base += remote_size
+        w = head_window(
+            self.ssm_sizes[1] * tp_size, tp_size, tp_rank, remote_tp_size, remote_rank
+        )
+        windows.append(
+            (self.ssm_sizes[0] + w.local, remote_ssm_sizes[0] + w.remote, w.count)
+        )
+        return windows
+
 
 def derive_mamba_conv_split(
     mamba_spec: MambaSpec,
@@ -161,6 +230,7 @@ def derive_mamba_conv_split(
     ssm_state_bytes = torch.Size(mamba_spec.shapes[1]).numel() * ssm_dtype_size
 
     local_proj_dims: tuple[int, ...]
+    proj_group_dims: tuple[int | None, ...] | None = None
     if mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA1:
         # Mamba1 conv state holds only x (no B/C), so it's a single
         # contiguous TP shard with no sub-projection decomposition.
@@ -194,6 +264,9 @@ def derive_mamba_conv_split(
         x_local = intermediate_size // local_tp
         b_local = groups_ss // local_tp
         local_proj_dims = (x_local, b_local, b_local)
+        # B and C are whole groups of ssm_state_size columns per rank.
+        state_size = mamba_spec.shapes[1][2]
+        proj_group_dims = (None, state_size, state_size)
     elif mamba_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN:
         # GDN: conv = [Q, K, V] where dim(Q) == dim(K) == key_dim.
         # conv_dim = key_dim*2 + value_dim (all global, divided by TP).
@@ -221,6 +294,7 @@ def derive_mamba_conv_split(
         local_proj_dims=local_proj_dims,
         conv_dtype_size=conv_dtype_size,
         ssm_sizes=(conv_state_bytes, ssm_state_bytes),
+        proj_group_dims=proj_group_dims,
     )
 
 

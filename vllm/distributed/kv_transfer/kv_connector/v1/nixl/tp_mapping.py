@@ -8,7 +8,10 @@ from dataclasses import dataclass
 
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
+    HeadWindow,
     TransferTopology,
+    head_slice,
+    head_window,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
 
@@ -33,21 +36,6 @@ def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
 
 def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
     return issubclass(spec_type, MambaSpec)
-
-
-@dataclass(frozen=True, slots=True)
-class HeadWindow:
-    """The KV heads a local rank reads from one remote rank.
-
-    `local` and `remote` index the first shared head within each rank's own
-    head slice; `count` heads follow. In a head-major block of `local_heads`
-    heads the window is the byte range [len * local, len * (local + count))
-    / local_heads, and the same fraction of a remote block of equal length.
-    """
-
-    local: int
-    remote: int
-    count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,35 +66,6 @@ class TPMapping:
 # ======================================================================
 # TP mapping computation
 # ======================================================================
-
-
-def head_slice(total_num_kv_heads: int, tp_size: int, tp_rank: int) -> tuple[int, int]:
-    """(first KV head, head count) held by `tp_rank`.
-
-    TP splits the head axis into `tp_size` equal ranges. With more ranks than
-    heads, each rank holds the single head `tp_rank * heads // tp_size`.
-    """
-    if tp_size <= total_num_kv_heads:
-        count = total_num_kv_heads // tp_size
-        return tp_rank * count, count
-    return tp_rank * total_num_kv_heads // tp_size, 1
-
-
-def head_window(
-    total_num_kv_heads: int,
-    tp_size: int,
-    tp_rank: int,
-    remote_tp_size: int,
-    remote_rank: int,
-) -> HeadWindow:
-    """The KV heads two ranks share: the intersection of their head slices."""
-    local_first, local_count = head_slice(total_num_kv_heads, tp_size, tp_rank)
-    remote_first, remote_count = head_slice(
-        total_num_kv_heads, remote_tp_size, remote_rank
-    )
-    first = max(local_first, remote_first)
-    end = min(local_first + local_count, remote_first + remote_count)
-    return HeadWindow(first - local_first, first - remote_first, max(0, end - first))
 
 
 def compute_tp_mapping(

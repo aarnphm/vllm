@@ -556,6 +556,55 @@ class EngineTransferInfo:
 # ---- Transfer topology ----
 
 
+# ----------------------------------------------------------------------------
+# Head slices under TP
+# ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class HeadWindow:
+    """The heads a local rank reads from one remote rank.
+
+    A head is any unit TP shards whole: an attention KV head, or a Mamba
+    group or head. `local` and `remote` index the first shared head within
+    each rank's own slice; `count` heads follow. In a head-major region of
+    `heads` heads the window is the byte range
+    [len * local, len * (local + count)) / heads.
+    """
+
+    local: int
+    remote: int
+    count: int
+
+
+def head_slice(total_heads: int, tp_size: int, tp_rank: int) -> tuple[int, int]:
+    """(first head, head count) held by `tp_rank`.
+
+    TP splits the head axis into `tp_size` equal ranges. With more ranks than
+    heads, each rank holds the single head `tp_rank * heads // tp_size`
+    (the shard of QKVParallelLinear, and Mamba2's duplicated group).
+    """
+    if tp_size <= total_heads:
+        count = total_heads // tp_size
+        return tp_rank * count, count
+    return tp_rank * total_heads // tp_size, 1
+
+
+def head_window(
+    total_heads: int,
+    tp_size: int,
+    tp_rank: int,
+    remote_tp_size: int,
+    remote_rank: int,
+) -> HeadWindow:
+    """The heads two ranks share: the intersection of their head slices."""
+    local_first, local_count = head_slice(total_heads, tp_size, tp_rank)
+    remote_first, remote_count = head_slice(total_heads, remote_tp_size, remote_rank)
+    first = max(local_first, remote_first)
+    end = min(local_first + local_count, remote_first + remote_count)
+    return HeadWindow(first - local_first, first - remote_first, max(0, end - first))
+
+
 @dataclass
 class TransferTopology:
     """Single source of truth for local TP identity and per-engine remote info."""

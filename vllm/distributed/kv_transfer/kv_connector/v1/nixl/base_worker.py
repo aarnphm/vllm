@@ -321,12 +321,14 @@ class NixlBaseConnectorWorker:
         src_blocks_data: np.ndarray,
         num_fa_descs: int,
         block_size_ratio: int = 1,
+        ssm_windows: dict[int, list[tuple[int, int, int]]] | None = None,
     ) -> Iterator[np.ndarray]:
         """Build split handle data for P_TP > D_TP scenario.
 
         num_fa_descs is the boundary between FA and SSM descriptors.
-        FA takes each source rank's head window (`plan.head_windows`);
-        SSM splits by the rank's positional index.
+        FA takes each source rank's head window (`plan.head_windows`); SSM
+        takes each source rank's window into every conv sub-projection and
+        the temporal state (`ssm_windows`, from `_ssm_read_windows`).
         Each Nx5 strided desc covers one region, so slicing it slices every block.
         """
         fa_idx = next(
@@ -364,17 +366,30 @@ class NixlBaseConnectorWorker:
         )
         fa_split = is_fa.copy()
         fa_split[is_fa] = ~fa_replicated
-        ssm_split = ~is_fa & (starts < sharded_desc_end)
+        ssm_rows = np.flatnonzero(~is_fa & (starts < sharded_desc_end))
+        if ssm_num_splits:
+            # SSM rows repeat per region: conv sub-projections, then temporal.
+            assert self._conv_decomp is not None and ssm_windows is not None
+            part_starts = [off for off, _ in self._conv_decomp.local_conv_offsets]
+            part_starts.append(self._mamba_ssm_size[0])
+            part_of_row = np.arange(len(ssm_rows)) % len(part_starts)
 
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
+        for p_rank in plan.all_source_ranks:
             window = plan.head_windows[p_rank]
             handle = src_blocks_data.copy()
             block_len = handle[fa_split, 1]
             handle[fa_split, 0] += block_len * window.local // plan.local_heads
             handle[fa_split, 1] = block_len * window.count // plan.local_heads
             if ssm_num_splits:
-                handle[ssm_split, 1] //= ssm_num_splits
-                handle[ssm_split, 0] += p_idx * handle[ssm_split, 1]
+                assert ssm_windows is not None
+                windows = ssm_windows[p_rank]
+                shift = np.array(
+                    [w[0] - start for w, start in zip(windows, part_starts)],
+                    dtype=np.uint64,
+                )
+                length = np.array([w[2] for w in windows], dtype=np.uint64)
+                handle[ssm_rows, 0] += shift[part_of_row]
+                handle[ssm_rows, 1] = length[part_of_row]
             yield handle
 
     def _needs_split_local_xfer_handles(self, tp_ratio: int, plan: TPMapping) -> bool:
@@ -2219,32 +2234,40 @@ class NixlBaseConnectorWorker:
 
         return self._pack_strided_descs(strided_descs)
 
+    def _ssm_read_windows(
+        self, remote_ssm_sizes: tuple[int, int], remote_tp_size: int, remote_rank: int
+    ) -> list[tuple[int, int, int]]:
+        """Per conv sub-projection, then the temporal state: the
+        (local offset, remote offset, length) this rank reads from
+        `remote_rank`. Mamba state is TP-sharded even when attention KV is
+        replicated (num_kv_heads < tp_size)."""
+        assert self._conv_decomp is not None and self.transfer_topo is not None
+        return self._conv_decomp.read_windows(
+            remote_ssm_sizes,
+            self.transfer_topo.tp_size,
+            self.transfer_topo.tp_rank,
+            remote_tp_size,
+            remote_rank,
+        )
+
     def _build_mamba_remote(
         self,
         nixl_agent_meta: NixlAgentMetadata,
-        tp_ratio: int,
+        remote_tp_size: int,
+        remote_tp_rank: int,
         transfer_info: EngineTransferInfo,
         pairs: _RegionPairs,
     ) -> np.ndarray:
         """Build remote desc regions (conv sub-projections + ssm) per layer.
-        For hetero-TP, each D rank reads only its sub-projection slice from
-        the P rank. The remote SSM and PLE regions come from `pairs`.
-        Returns Nx5 uint64 strided descs."""
+        Each D rank reads the part of each sub-projection it shares with the
+        P rank (`_ssm_read_windows`). The remote SSM and PLE regions come
+        from `pairs`. Returns Nx5 uint64 strided descs."""
         assert nixl_agent_meta.kv_caches_base_addr, (
             "Remote KV cache base addresses must not be empty."
         )
-        assert self._conv_decomp is not None
-        effective_ratio = max(tp_ratio, 1)
-        # Mamba conv state is always TP-sharded, even when attention KV
-        # is replicated (num_kv_heads < tp_size).
-        local_offset = self.tp_rank % effective_ratio
-        conv_size_remote = nixl_agent_meta.ssm_sizes[0]
-
-        conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
-        if tp_ratio >= 1:
-            ssm_read_size = self._mamba_ssm_size[1]
-        else:
-            ssm_read_size = nixl_agent_meta.ssm_sizes[1]
+        windows = self._ssm_read_windows(
+            nixl_agent_meta.ssm_sizes, remote_tp_size, remote_tp_rank
+        )
 
         remote_physical_per_logical = transfer_info.remote_physical_blocks_per_logical
         num_blocks = nixl_agent_meta.num_blocks // remote_physical_per_logical
@@ -2260,15 +2283,16 @@ class NixlBaseConnectorWorker:
             block_stride = (
                 nixl_agent_meta.block_strides[i] * remote_physical_per_logical
             )
-            for off, sz in conv_offsets:
+            for _, remote_offset, length in windows:
                 strided_descs.append(
-                    (base_addr + off, sz, device_id, block_stride, num_blocks)
+                    (
+                        base_addr + remote_offset,
+                        length,
+                        device_id,
+                        block_stride,
+                        num_blocks,
+                    )
                 )
-            # SSM temporal state is also TP-sharded on the heads dimension.
-            ssm_addr = base_addr + conv_size_remote + local_offset * ssm_read_size
-            strided_descs.append(
-                (ssm_addr, ssm_read_size, device_id, block_stride, num_blocks)
-            )
 
         if self._ple_region_index is not None:
             assert ple_region is not None, "Remote holds no PLE region"
@@ -2753,11 +2777,22 @@ class NixlBaseConnectorWorker:
             if self._mixed_mem_types:
                 self._dram_src_handles_by_tp_ratio[split_key] = []
 
+            ssm_windows = (
+                {
+                    p: self._ssm_read_windows(
+                        nixl_agent_meta.ssm_sizes, remote_tp_size, p
+                    )
+                    for p in plan.all_source_ranks
+                }
+                if self._has_mamba
+                else None
+            )
             for handle_data in self._build_local_splits_from_plan(
                 plan,
                 src_blocks_data,
                 self.num_descs * block_size_ratio,
                 block_size_ratio,
+                ssm_windows,
             ):
                 if self._mixed_mem_types:
                     desc_is_dram = self._desc_is_dram_by_block_size[remote_block_size]
@@ -2807,7 +2842,7 @@ class NixlBaseConnectorWorker:
                 remote_tp_rank,
             )
             mamba = self._build_mamba_remote(
-                nixl_agent_meta, tp_ratio, transfer_info, pairs
+                nixl_agent_meta, remote_tp_size, remote_tp_rank, transfer_info, pairs
             )
             blocks_data = np.concatenate([blocks_data, mamba])
 

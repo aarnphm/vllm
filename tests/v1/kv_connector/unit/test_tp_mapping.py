@@ -193,7 +193,9 @@ def _make_mock_worker_for_splits(group_spec_types):
     worker.block_len_per_layer = []
     worker.num_regions = 0
     worker._region_is_mla = []
+    # No conv sub-projections: each SSM desc is one 400-byte temporal state.
     worker._conv_decomp = SimpleNamespace(local_conv_offsets=())
+    worker._mamba_ssm_size = (0, 400)
     worker._ssm_region_indices = [0] if MambaSpec in group_spec_types else []
     worker._ple_region_index = None
     return worker
@@ -231,6 +233,11 @@ class TestBuildSrcSplitHandles:
             assert handle[:, 3:].tolist() == [[1024, 8]]
 
 
+# Two P ranks each hold half of D's temporal state: (local offset, remote
+# offset, length) per source rank, as `_ssm_read_windows` gives it.
+_SSM_HALVES = {0: [(0, 0, 200)], 1: [(200, 0, 200)]}
+
+
 class TestMambaPlanSplitHandles:
     """Verify split handles for Mamba with FA/SSM distinction."""
 
@@ -256,7 +263,11 @@ class TestMambaPlanSplitHandles:
             dtype=np.uint64,
         )
 
-        splits = list(worker._build_local_splits_from_plan(plan, src_blocks_data, 2))
+        splits = list(
+            worker._build_local_splits_from_plan(
+                plan, src_blocks_data, 2, ssm_windows=_SSM_HALVES
+            )
+        )
 
         assert len(splits) == 2  # 2 source ranks
 
@@ -300,7 +311,11 @@ class TestMambaPlanSplitHandles:
             dtype=np.uint64,
         )
 
-        splits = list(worker._build_local_splits_from_plan(plan, src_blocks_data, 4, 2))
+        splits = list(
+            worker._build_local_splits_from_plan(
+                plan, src_blocks_data, 4, 2, ssm_windows=_SSM_HALVES
+            )
+        )
 
         assert len(splits) == 2
         fa_passthrough = [[1000, 100, 0, 100, 2], [2000, 100, 0, 100, 2]]
@@ -324,7 +339,11 @@ class TestMambaPlanSplitHandles:
         )
 
         with pytest.raises(AssertionError, match="Head-sharded"):
-            list(worker._build_local_splits_from_plan(plan, src_blocks_data, 2, 2))
+            list(
+                worker._build_local_splits_from_plan(
+                    plan, src_blocks_data, 2, 2, ssm_windows=_SSM_HALVES
+                )
+            )
 
 
 @pytest.mark.parametrize(
