@@ -942,10 +942,11 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
+        """Whether the model has Mamba layers on any pipeline stage."""
         return any(
             isinstance(spec, MambaSpec)
             for group in self.kv_cache_groups
-            for spec in group.kv_cache_specs.values()
+            for spec in group.distinct_specs
         )
 
     @property

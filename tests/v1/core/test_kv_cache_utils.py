@@ -1906,6 +1906,29 @@ def test_generate_scheduler_kv_cache_config_keeps_zeroing(
     assert scheduler_config.needs_kv_cache_zeroing is needs_zeroing
 
 
+def test_generate_scheduler_kv_cache_config_sees_mamba_on_later_stage():
+    """The scheduler's config is stage 0's projection. Mamba layers held only by
+    a later PP stage must still turn on the scheduler's Mamba prefix-caching
+    alignment and the connectors' Mamba handling."""
+    config = VllmConfig(model_config=ModelConfig(max_model_len=128))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    configs = get_kv_cache_configs(
+        config,
+        [
+            {"layer_0": full_layer(new_kv_cache_spec())},
+            {
+                "layer_1": full_layer(new_kv_cache_spec()),
+                "layer_2": new_mamba_layer(enable_prefix_caching=True),
+            },
+        ],
+        [2**20, 2**20],
+    )
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    assert scheduler_config.has_mamba_layers
+    assert configs[0].has_mamba_layers
+    assert configs[1].has_mamba_layers
+
+
 def test_resolve_dcp_kv_block_size_scales_only_sharded_groups():
     attention = AttentionSpec(
         block_size=16,
