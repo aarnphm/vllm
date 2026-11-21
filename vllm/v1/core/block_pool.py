@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
+    FreeKVCacheBlockQueueCountingBlockIds,
     KVCacheBlock,
     generate_block_hash_extra_keys,
     generate_lookahead_block_hash_extra_keys,
@@ -123,6 +124,11 @@ class BlockPool:
         metrics_collector: Optional metrics collector for tracking block residency.
         num_hash_lookahead_tokens: Tokens after each block covered by its hash.
         medium: Storage medium reported in KV cache events.
+        max_block_ids_per_block: With one KV cache group per KVCacheSpec, the
+            most member KV cache groups of any manager. A block then holds one
+            block id per member group (`KVCacheBlock.group_block_ids`), cached
+            under one hash key and evicted together, and free blocks are
+            counted in block ids. 0 keeps one block id per block.
 
     """
 
@@ -135,6 +141,7 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_hash_lookahead_tokens: int = 0,
         medium: str = MEDIUM_GPU,
+        max_block_ids_per_block: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -150,7 +157,14 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.max_block_ids_per_block = max_block_ids_per_block
+        self.free_block_queue: FreeKVCacheBlockQueue
+        if max_block_ids_per_block:
+            for block in self.blocks:
+                block.group_block_ids = (block.block_id,)
+            self.free_block_queue = FreeKVCacheBlockQueueCountingBlockIds(self.blocks)
+        else:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap(
@@ -163,6 +177,11 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        if max_block_ids_per_block:
+            # The null block stands for the null block id in every member group.
+            self.null_block.group_block_ids = (
+                self.null_block.block_id,
+            ) * max_block_ids_per_block
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -678,18 +697,25 @@ class BlockPool:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, num_kv_cache_groups: int = 1
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            num_kv_cache_groups: With one KV cache group per KVCacheSpec, the
+                member KV cache groups each block holds a block id for.
 
         Returns:
             A list of new block.
 
         """
+        if self.max_block_ids_per_block:
+            return self._get_new_blocks_for_groups(num_blocks, num_kv_cache_groups)
+        assert num_kv_cache_groups == 1
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
@@ -719,6 +745,61 @@ class BlockPool:
                 block.ref_cnt = 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        return ret
+
+    def _get_new_blocks_for_groups(
+        self, num_blocks: int, num_kv_cache_groups: int
+    ) -> list[KVCacheBlock]:
+        """`get_new_blocks` with one KV cache group per KVCacheSpec.
+
+        Pops free blocks until they hold `num_blocks * num_kv_cache_groups`
+        block ids. A popped cached block is evicted with all its block ids, so
+        no hash key is left with a block id missing. Block ids of blocks that
+        hold another number of ids are regrouped, in any order; leftover ids
+        return to the front of the free block queue unhashed, one per block.
+        """
+        assert 0 < num_kv_cache_groups <= self.max_block_ids_per_block
+        if num_blocks * num_kv_cache_groups > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        queue = self.free_block_queue
+        blocks = self.blocks
+        evict = self.enable_caching
+        metrics_collector = self.metrics_collector
+        ret: list[KVCacheBlock] = []
+        # Block ids popped from the queue and not yet held by a returned block.
+        loose_ids: list[int] = []
+        while len(ret) < num_blocks:
+            block = queue.popleft()
+            if self._reuse_watchers:
+                self._notify_reuse((block,))
+            if evict and (block.block_hash is not None or metrics_collector):
+                self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block_ids = block.group_block_ids
+            assert block_ids
+            if not loose_ids and len(block_ids) == num_kv_cache_groups:
+                ret.append(block)
+                continue
+            loose_ids.extend(block_ids)
+            while len(loose_ids) >= num_kv_cache_groups and len(ret) < num_blocks:
+                block_ids = tuple(loose_ids[:num_kv_cache_groups])
+                del loose_ids[:num_kv_cache_groups]
+                block = blocks[block_ids[0]]
+                block.group_block_ids = block_ids
+                for block_id in block_ids[1:]:
+                    blocks[block_id].group_block_ids = ()
+                ret.append(block)
+        if loose_ids:
+            leftover = [blocks[block_id] for block_id in loose_ids]
+            for block in leftover:
+                block.group_block_ids = (block.block_id,)
+            queue.prepend_n(leftover)
+
+        for block in ret:
+            block.ref_cnt = 1
+            if metrics_collector:
+                metrics_collector.on_block_allocated(block)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:

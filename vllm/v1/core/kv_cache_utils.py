@@ -183,6 +183,13 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # With one KV cache group per KVCacheSpec: the block ids this block holds,
+    # one per member KV cache group, `block_id` first. Empty while another
+    # block holds `block_id`. None with one manager per KV cache group.
+    group_block_ids: tuple[int, ...] | None = field(
+        default=None, repr=False, compare=False, kw_only=True
+    )
+
     def set_block_hash(
         self,
         block_hash: BlockHashWithGroupId,
@@ -507,6 +514,53 @@ class FreeKVCacheBlockQueue:
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
             yield curr_block
             curr_block = curr_block.next_free_block
+
+
+def _num_block_ids(blocks: Iterable[KVCacheBlock]) -> int:
+    num_block_ids = 0
+    for block in blocks:
+        assert block.group_block_ids is not None
+        num_block_ids += len(block.group_block_ids)
+    return num_block_ids
+
+
+class FreeKVCacheBlockQueueCountingBlockIds(FreeKVCacheBlockQueue):
+    """Free block queue for one KV cache group per KVCacheSpec.
+
+    A queued block holds one block id per member KV cache group
+    (`KVCacheBlock.group_block_ids`), and `num_free_blocks` counts block ids,
+    so free capacity stays in the unit `KVCacheConfig.num_blocks` is in.
+    """
+
+    def popleft(self) -> KVCacheBlock:
+        block = super().popleft()
+        block_ids = block.group_block_ids
+        assert block_ids is not None
+        self.num_free_blocks -= len(block_ids) - 1
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        return [self.popleft() for _ in range(n)]
+
+    def remove(self, block: KVCacheBlock) -> None:
+        super().remove(block)
+        block_ids = block.group_block_ids
+        assert block_ids is not None
+        self.num_free_blocks -= len(block_ids) - 1
+
+    def append(self, block: KVCacheBlock) -> None:
+        super().append(block)
+        block_ids = block.group_block_ids
+        assert block_ids is not None
+        self.num_free_blocks += len(block_ids) - 1
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        super().prepend_n(blocks)
+        self.num_free_blocks += _num_block_ids(blocks) - len(blocks)
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        super().append_n(blocks)
+        self.num_free_blocks += _num_block_ids(blocks) - len(blocks)
 
 
 def _gen_mm_extra_hash_keys(
