@@ -384,6 +384,8 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            # KV connectors read block ids and hash keys per KV cache group.
+            allow_one_group_per_spec=self.connector is None,
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -392,7 +394,8 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         self._spec_decode_step_blocks = sum(
-            cdiv(num_spec_decode_tokens, manager.block_size)
+            manager.num_kv_cache_groups
+            * cdiv(num_spec_decode_tokens, manager.block_size)
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager, MambaManager)
         )

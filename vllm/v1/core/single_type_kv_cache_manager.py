@@ -182,6 +182,7 @@ class SingleTypeKVCacheManager(ABC):
         needs_kv_cache_zeroing: bool = False,
         max_admission_blocks_per_request: int | None = None,
         retention_interval: int | None = None,
+        num_kv_cache_groups: int = 1,
     ) -> None:
         """Initializes the SingleTypeKVCacheManager.
 
@@ -204,8 +205,13 @@ class SingleTypeKVCacheManager(ABC):
                 block until the request finishes.
             retention_interval: The prefix-cache retention interval; `None`
                 is dense (see `cache_blocks`).
+            num_kv_cache_groups: With one KV cache group per KVCacheSpec, the
+                member KV cache groups this manager allocates for. Each block
+                then holds one block id per member group, and
+                `kv_cache_group_id` indexes the managers.
 
         """
+        self.num_kv_cache_groups = num_kv_cache_groups
         self.manager_config = kv_cache_group.manager_config
         self.scheduler_block_size = scheduler_block_size
         # Hybrid fine-grained lookup may lower this after all participating
@@ -487,10 +493,12 @@ class SingleTypeKVCacheManager(ABC):
         ) - len(req_blocks)
         req_blocks.extend([self._null_block] * max(num_null_blocks, 0))
         num_new_blocks = max(0, num_computed_blocks - len(req_blocks))
-        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        allocated_blocks = self.block_pool.get_new_blocks(
+            num_new_blocks, self.num_kv_cache_groups
+        )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids and record_for_zeroing:
-            self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+            self.extend_new_block_ids(allocated_blocks)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -517,9 +525,9 @@ class SingleTypeKVCacheManager(ABC):
             # correct; the extra block was reserved by
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            cow_block = self.block_pool.get_new_blocks(1, self.num_kv_cache_groups)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
-            self.new_block_ids.append(cow_block.block_id)
+            self.extend_new_block_ids((cow_block,))
             cow_blocks.append(cow_block)
 
         req_blocks = self.req_to_blocks[request_id]
@@ -534,10 +542,12 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return null_blocks + cow_blocks
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, self.num_kv_cache_groups
+            )
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
-                self.new_block_ids.extend(b.block_id for b in new_blocks)
+                self.extend_new_block_ids(new_blocks)
             return null_blocks + cow_blocks + new_blocks
 
     def _num_unbacked_leading_blocks(self, num_tokens_main_model: int) -> int:
@@ -549,6 +559,15 @@ class SingleTypeKVCacheManager(ABC):
     def records_new_block_ids(self) -> bool:
         """Whether this manager's new blocks are zeroed by the worker."""
         return self._record_new_block_ids
+
+    def extend_new_block_ids(self, blocks: Iterable[KVCacheBlock]) -> None:
+        """Record the block ids of `blocks`, in every member KV cache group."""
+        if self.num_kv_cache_groups == 1:
+            self.new_block_ids.extend(block.block_id for block in blocks)
+            return
+        for block in blocks:
+            assert block.group_block_ids is not None
+            self.new_block_ids.extend(block.group_block_ids)
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
@@ -2463,7 +2482,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks, self.num_kv_cache_groups
+                )
                 returned_blocks = req_blocks[prev_block_len:]
                 if partial_hit is not None:
                     block_idx, source_block = partial_hit

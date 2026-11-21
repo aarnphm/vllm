@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -52,14 +53,38 @@ class KVCacheBlocks:
       (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
     """
 
+    manager_group_ids: tuple[tuple[int, ...], ...] | None = None
+    """
+    With one KV cache group per KVCacheSpec: `blocks[i]` are the blocks of the
+    i-th manager, `manager_group_ids[i]` its member KV cache groups, and each
+    block holds one block id per member group. `get_block_ids` still returns
+    one list per KV cache group.
+    """
+
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Adds two KVCacheBlocks instances."""
         return KVCacheBlocks(
             tuple(
                 list(itertools.chain(blk1, blk2))
                 for blk1, blk2 in zip(self.blocks, other.blocks)
-            )
+            ),
+            self.manager_group_ids,
         )
+
+    def _get_block_ids_per_group(self) -> tuple[list[int], ...]:
+        """Block ids per KV cache group, from blocks per manager."""
+        assert self.manager_group_ids is not None
+        ids: dict[int, list[int]] = {}
+        for blocks, group_ids in zip(self.blocks, self.manager_group_ids, strict=True):
+            if len(group_ids) == 1:
+                ids[group_ids[0]] = [blk.block_id for blk in blocks]
+                continue
+            for i, group_id in enumerate(group_ids):
+                ids[group_id] = [
+                    blk.group_block_ids[i]  # type: ignore[index]
+                    for blk in blocks
+                ]
+        return tuple(ids[group_id] for group_id in range(len(ids)))
 
     @overload
     def get_block_ids(
@@ -96,6 +121,13 @@ class KVCacheBlocks:
                   group
 
         """
+        if self.manager_group_ids is not None:
+            block_ids = self._get_block_ids_per_group()
+            if group_ids is not None:
+                block_ids = tuple(block_ids[group_id] for group_id in group_ids)
+            if allow_none and not any(block_ids):
+                return None
+            return block_ids
         groups = (
             self.blocks
             if group_ids is None
@@ -124,7 +156,9 @@ class KVCacheBlocks:
 
     def new_empty(self) -> "KVCacheBlocks":
         """Creates a new KVCacheBlocks instance with no blocks."""
-        return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
+        return KVCacheBlocks(
+            tuple(() for _ in range(len(self.blocks))), self.manager_group_ids
+        )
 
 
 class KVCacheManager:
@@ -146,6 +180,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        allow_one_group_per_spec: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -178,7 +213,12 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            one_group_per_spec=allow_one_group_per_spec
+            and envs.VLLM_KV_ONE_GROUP_PER_SPEC,
         )
+        # With one KV cache group per KVCacheSpec: the member KV cache groups
+        # of each manager. None: one manager per KV cache group.
+        self.manager_group_ids = self.coordinator.manager_group_ids
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
         # junction costs a forward pass and displaces the block-boundary stop.
@@ -212,7 +252,7 @@ class KVCacheManager:
                 get_kv_cache_kind(group.manager_config, group.distinct_specs).value,
                 getattr(group.manager_config.params, "sliding_window", None),
             )
-            for group in kv_cache_config.kv_cache_groups
+            for group in self.coordinator.kv_cache_config.kv_cache_groups
         )
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
@@ -221,7 +261,8 @@ class KVCacheManager:
         #
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
         self.empty_kv_cache_blocks = KVCacheBlocks(
-            tuple(() for _ in range(self.num_kv_cache_groups))
+            tuple(() for _ in self.coordinator.single_type_managers),
+            self.manager_group_ids,
         )
 
     @property
@@ -777,7 +818,7 @@ class KVCacheManager:
         """Estimate the number of tokens cached by the request."""
         cached_tokens: int | None = None
         for group, blocks in zip(
-            self.kv_cache_config.kv_cache_groups,
+            self.coordinator.kv_cache_config.kv_cache_groups,
             self.get_blocks(request.request_id).blocks,
         ):
             if not group.prefix_cacheable:
@@ -817,7 +858,9 @@ class KVCacheManager:
         self, blocks: tuple[list[KVCacheBlock], ...]
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
-        return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+        if not any(blocks):
+            return self.empty_kv_cache_blocks
+        return KVCacheBlocks(blocks, self.manager_group_ids)
 
     def truncate_computed_blocks(
         self, blocks: KVCacheBlocks, num_computed_tokens: int
@@ -832,7 +875,7 @@ class KVCacheManager:
         for group_blocks, manager, group in zip(
             blocks.blocks,
             self.coordinator.single_type_managers,
-            self.kv_cache_config.kv_cache_groups,
+            self.coordinator.kv_cache_config.kv_cache_groups,
             strict=True,
         ):
             if not group.prefix_cacheable:
@@ -871,7 +914,7 @@ class KVCacheManager:
                 assert start_token % mgr.block_size == 0
                 start_idx = start_token // mgr.block_size
                 blocks = mgr.req_to_blocks[request_id]
-                mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+                mgr.extend_new_block_ids(blocks[start_idx:])
 
     def take_kv_cache_block_copies(
         self,
@@ -880,13 +923,25 @@ class KVCacheManager:
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         for mgr in self.coordinator.single_type_managers:
             pending_copies.extend(mgr.take_pending_cow_copies())
-        copies = [
-            KVCacheBlockCopy(
-                src_block_id=source_block.block_id,
-                dst_block_id=cow_block.block_id,
-            )
-            for source_block, cow_block in pending_copies
-        ]
+        if self.manager_group_ids is None:
+            copies = [
+                KVCacheBlockCopy(
+                    src_block_id=source_block.block_id,
+                    dst_block_id=cow_block.block_id,
+                )
+                for source_block, cow_block in pending_copies
+            ]
+        else:
+            # One copy per member KV cache group of the blocks' manager.
+            copies = [
+                KVCacheBlockCopy(src_block_id=src, dst_block_id=dst)
+                for source_block, cow_block in pending_copies
+                for src, dst in zip(
+                    source_block.group_block_ids or (),
+                    cow_block.group_block_ids or (),
+                    strict=True,
+                )
+            ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
 
@@ -907,14 +962,26 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             for (
                 req_id,
-                group_id,
+                manager_idx,
                 block,
                 boundary_tokens,
             ) in mgr.take_pending_boundary_state_offloads():
-                offloads.setdefault(req_id, []).append(
-                    (group_id, block.block_id, boundary_tokens)
+                offloads.setdefault(req_id, []).extend(
+                    (group_id, block_id, boundary_tokens)
+                    for group_id, block_id in self._block_id_per_group(
+                        manager_idx, block
+                    )
                 )
         return offloads
+
+    def _block_id_per_group(
+        self, manager_idx: int, block: KVCacheBlock
+    ) -> Iterable[tuple[int, int]]:
+        """`(kv_cache_group_id, block_id)` of `block` for each KV cache group
+        of the manager that allocated it."""
+        if self.manager_group_ids is None:
+            return ((manager_idx, block.block_id),)
+        return zip(self.manager_group_ids[manager_idx], block.group_block_ids or ())
 
     def finalize_partial_tail_offloads(
         self, request: Request
@@ -935,8 +1002,11 @@ class KVCacheManager:
             )
             if finalized is None:
                 continue
-            group_id, block, boundary_tokens = finalized
-            offloads.append((group_id, block.block_id, boundary_tokens))
+            manager_idx, block, boundary_tokens = finalized
+            offloads.extend(
+                (group_id, block_id, boundary_tokens)
+                for group_id, block_id in self._block_id_per_group(manager_idx, block)
+            )
         return offloads
 
     def new_step_starts(self) -> None:

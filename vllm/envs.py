@@ -305,6 +305,7 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
+    VLLM_KV_ONE_GROUP_PER_SPEC: bool = False
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
@@ -2189,6 +2190,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # raw bytes. Defaults to True for backward compatibility.
     "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": lambda: bool(
         int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1"))
+    ),
+    # Experimental: on the scheduler side, one KV cache group (one manager, one
+    # block table) per KVCacheSpec. Where the planner split a spec's layers
+    # into several groups, a block holds one block id per member group for
+    # each block position; they are allocated, cached under one hash key, freed
+    # and evicted together. The worker still receives one block-id list per
+    # planner group. Not used with KV connectors, DCP, EAGLE or HiSparse.
+    "VLLM_KV_ONE_GROUP_PER_SPEC": lambda: bool(
+        int(os.getenv("VLLM_KV_ONE_GROUP_PER_SPEC", "0"))
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".

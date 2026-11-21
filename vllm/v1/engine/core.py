@@ -539,6 +539,9 @@ class EngineCore:
 
         kv_cache_manager = cast(Any, self.scheduler).kv_cache_manager
         managers = kv_cache_manager.coordinator.single_type_managers
+        if kv_cache_manager.manager_group_ids is not None:
+            # Events then carry the index of the manager as `group_idx`.
+            kv_cache_config = kv_cache_manager.coordinator.kv_cache_config
         metadata: list[dict[str, int | str | None]] = []
         for group_idx, (group, manager) in enumerate(
             zip(kv_cache_config.kv_cache_groups, managers, strict=True)

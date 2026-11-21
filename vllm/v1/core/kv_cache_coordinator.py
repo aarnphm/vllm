@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -22,6 +23,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     prefix_lookup_groups,
 )
 from vllm.v1.request import Request
@@ -109,7 +111,19 @@ class KVCacheCoordinator(ABC):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
         num_hash_lookahead_tokens: int = 0,
+        manager_group_ids: Sequence[Sequence[int]] | None = None,
     ):
+        # With one KV cache group per KVCacheSpec: the member KV cache groups
+        # of each manager, and `kv_cache_config` lists one group per manager
+        # (see `get_kv_cache_coordinator`). None: one manager per KV cache group.
+        self.manager_group_ids: tuple[tuple[int, ...], ...] | None = (
+            None
+            if manager_group_ids is None
+            else tuple(tuple(group_ids) for group_ids in manager_group_ids)
+        )
+        assert self.manager_group_ids is None or len(self.manager_group_ids) == len(
+            kv_cache_config.kv_cache_groups
+        )
         self.kv_cache_config = kv_cache_config
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
@@ -127,6 +141,10 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+            max_block_ids_per_block=max(
+                (len(group_ids) for group_ids in self.manager_group_ids or ()),
+                default=0,
+            ),
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -174,6 +192,9 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
                 retention_interval=kv_cache_config.prefix_cache_retention_interval,
+                num_kv_cache_groups=1
+                if self.manager_group_ids is None
+                else len(self.manager_group_ids[i]),
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -240,17 +261,23 @@ class KVCacheCoordinator(ABC):
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
+            # Free blocks are counted in block ids: one per member KV cache
+            # group for each block of the manager.
+            num_block_ids = manager.num_kv_cache_groups
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
+                num_blocks_to_allocate += (
+                    num_block_ids
+                    * manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
             else:
                 if apply_admission_cap:
@@ -258,17 +285,20 @@ class KVCacheCoordinator(ABC):
                         request_id, num_tokens
                     )
                     if reservation is not None:
-                        num_blocks_to_allocate += reservation
+                        num_blocks_to_allocate += num_block_ids * reservation
                         continue
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_local_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
-                    prefill_end=prefill_end,
+                num_blocks_to_allocate += (
+                    num_block_ids
+                    * manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_local_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                        prefill_end=prefill_end,
+                    )
                 )
         return num_blocks_to_allocate
 
@@ -520,6 +550,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
+        manager_group_ids: Sequence[Sequence[int]] | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -535,6 +566,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             num_prefill_lookahead=num_prefill_lookahead,
+            manager_group_ids=manager_group_ids,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -571,6 +603,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
+        manager_group_ids: Sequence[Sequence[int]] | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -586,6 +619,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             num_prefill_lookahead=num_prefill_lookahead,
+            manager_group_ids=manager_group_ids,
         )
         self.group_block_size = self.kv_cache_config.kv_cache_groups[0].block_size
         self.manager_config = self.kv_cache_config.kv_cache_groups[0].manager_config
@@ -646,6 +680,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
+        manager_group_ids: Sequence[Sequence[int]] | None = None,
         allow_partial_hash_hits: bool = True,
     ):
         super().__init__(
@@ -662,6 +697,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             num_prefill_lookahead=num_prefill_lookahead,
+            manager_group_ids=manager_group_ids,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -1001,6 +1037,58 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return tuple(hit_blocks), tuple(hit_lengths)
 
 
+# Managers whose block tables were checked to match across the KV cache groups
+# the planner split one spec's layers into: same length, same null positions.
+_ONE_GROUP_PER_SPEC_MANAGERS: tuple[type, ...] = (
+    FullAttentionManager,
+    SlidingWindowManager,
+    MambaManager,
+)
+
+
+def get_manager_group_ids(
+    kv_cache_config: KVCacheConfig,
+    use_eagle: bool,
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> list[list[int]] | None:
+    """The member KV cache groups of each manager, with one KV cache group,
+    one manager and one block table per `KVCacheSpec`: the planner's groups
+    that share a manager config, block size and spec (`prefix_lookup_groups`).
+    Groups outside prefix caching keep their own manager.
+
+    Returns None, which keeps one manager per planner group, for setups this
+    path does not cover: DCP/PCP, EAGLE groups, HiSparse, and a spec split
+    into several groups whose manager is not in `_ONE_GROUP_PER_SPEC_MANAGERS`.
+    """
+    groups = kv_cache_config.kv_cache_groups
+    if (
+        dcp_world_size > 1
+        or pcp_world_size > 1
+        or use_eagle
+        or kv_cache_config.hisparse_host_num_blocks is not None
+        or any(
+            g.is_eagle_group or g.host_resident or g.role != KVCacheGroupRole.DEFAULT
+            for g in groups
+        )
+    ):
+        return None
+    manager_group_ids = [lookup.group_ids for lookup in prefix_lookup_groups(groups)]
+    for group_ids in manager_group_ids:
+        first = groups[group_ids[0]]
+        if len(group_ids) > 1 and (
+            first.manager_cls not in _ONE_GROUP_PER_SPEC_MANAGERS
+            or any(
+                groups[i].enable_kv_transfer != first.enable_kv_transfer
+                for i in group_ids
+            )
+        ):
+            return None
+    in_lookup = {i for group_ids in manager_group_ids for i in group_ids}
+    manager_group_ids.extend([i] for i in range(len(groups)) if i not in in_lookup)
+    return sorted(manager_group_ids)
+
+
 def get_kv_cache_coordinator(
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
@@ -1016,7 +1104,29 @@ def get_kv_cache_coordinator(
     num_hash_lookahead_tokens: int = 0,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    one_group_per_spec: bool = False,
 ) -> KVCacheCoordinator:
+    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    manager_group_ids = (
+        get_manager_group_ids(
+            kv_cache_config, use_eagle, dcp_world_size, pcp_world_size
+        )
+        if one_group_per_spec
+        else None
+    )
+    if manager_group_ids is not None:
+        # The coordinator sees one KV cache group per manager: the first
+        # member stands for all, since they share manager config, block size
+        # and spec.
+        needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+        kv_cache_config = replace(
+            kv_cache_config,
+            kv_cache_groups=[
+                kv_cache_config.kv_cache_groups[group_ids[0]]
+                for group_ids in manager_group_ids
+            ],
+        )
+        kv_cache_config.needs_kv_cache_zeroing = needs_kv_cache_zeroing
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -1031,8 +1141,9 @@ def get_kv_cache_coordinator(
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             num_prefill_lookahead=num_prefill_lookahead,
+            manager_group_ids=manager_group_ids,
         )
-    if len(kv_cache_config.kv_cache_groups) == 1:
+    if num_kv_cache_groups == 1:
         return UnitaryKVCacheCoordinator(
             kv_cache_config,
             max_model_len,
@@ -1047,6 +1158,7 @@ def get_kv_cache_coordinator(
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             num_prefill_lookahead=num_prefill_lookahead,
+            manager_group_ids=manager_group_ids,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -1063,4 +1175,5 @@ def get_kv_cache_coordinator(
         num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
+        manager_group_ids=manager_group_ids,
     )
